@@ -21,38 +21,41 @@ app.get('/search', async (req, res) => {
         await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 1500));
 
-        // Step 2: Search
+        // Step 2: Execute Search
         const searchUrl = `https://catalog.denverlibrary.org/Search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(title)}`;
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 3000));
 
+        // Step 3: Extract titles using Regex on the raw page text
         const pageData = await page.evaluate(() => {
-            const allLinks = Array.from(document.querySelectorAll('a'));
+            // Compress all text on the page into a single clean string
+            const rawText = document.body.innerText.replace(/\s+/g, ' ');
             
-            // List of words that appear in junk links, buttons, and authors
-            const junkWords = [
-                'author', 'adapter', 'available', 'click here', 'excerpt', 
-                'search', 'account', 'log in', 'holds', 'fees', 'saved', 
-                'sign in', 'help', 'details', 'place hold', 'my list', 'checkout'
-            ];
+            // Look for the pattern: [Number][Dot][Space][TITLE][Space]by[Space]
+            const regex = /\b\d+\.\s+(.*?)(?=\s+by\s+)/gi;
+            const matches = [];
+            let match;
             
-            let titles = allLinks
-                .map(a => a.innerText.replace(/\s+/g, ' ').trim())
-                .filter(text => text.length > 5) // Ignore empty or tiny links
-                .filter(text => !junkWords.some(junk => text.toLowerCase().includes(junk)));
+            // Loop through the text and pull out every title that fits the pattern
+            while ((match = regex.exec(rawText)) !== null) {
+                if (match[1] && match[1].length > 3) {
+                    matches.push(match[1].trim());
+                }
+            }
 
             return {
-                results: Array.from(new Set(titles)).slice(0, 5)
+                results: Array.from(new Set(matches)).slice(0, 5),
+                debugText: rawText.substring(0, 500)
             };
         });
 
         await browser.close();
 
         if (pageData.results.length > 0) {
-            return res.json({ status: "success", query: title, results: pageData.results });
+            return res.json({ status: "success", query: title, count: pageData.results.length, results: pageData.results });
         }
 
-        return res.json({ status: "empty", query: title, message: "No clean titles found after filtering." });
+        return res.json({ status: "empty", query: title, message: "Could not parse titles from text.", text: pageData.debugText });
 
     } catch (err) {
         if (browser) await browser.close();
