@@ -23,15 +23,24 @@ app.get('/search', async (req, res) => {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         
         const url = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-        await page.waitForSelector('.cp-search-result-item', { timeout: 15000 });
+        // Wait for results container or list item
+        await page.waitForSelector('.cp-search-result-item, .cp-batch-actions-list-item, [data-key="bib-title"]', { timeout: 20000 });
 
         const results = await page.evaluate(() => {
-            const items = Array.from(document.querySelectorAll('.cp-search-result-item')).slice(0, 3);
+            // Target search result cards flexibly
+            const items = Array.from(document.querySelectorAll('.cp-search-result-item, .cp-batch-actions-list-item')).slice(0, 3);
+            
+            if (items.length === 0) {
+                // Fallback extraction if container classes changed
+                const titles = Array.from(document.querySelectorAll('[data-key="bib-title"]')).slice(0, 3);
+                return titles.map(t => t.innerText.trim());
+            }
+
             return items.map(item => {
-                const titleEl = item.querySelector('.cp-title');
-                const availEl = item.querySelector('.cp-availability-status');
+                const titleEl = item.querySelector('.cp-title, [data-key="bib-title"]');
+                const availEl = item.querySelector('.cp-availability-status, .cp-availability');
                 
                 const t = titleEl ? titleEl.innerText.trim() : "Unknown Title";
                 const a = availEl ? availEl.innerText.trim() : "Status Unknown";
