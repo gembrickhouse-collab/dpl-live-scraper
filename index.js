@@ -3,9 +3,24 @@ const puppeteer = require('puppeteer-core');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get('/search', async (req, res) => {
-    const title = req.query.title;
-    if (!title) return res.json({ error: "No title provided" });
+// Allow Express to read the URL-encoded POST data Twilio sends
+app.use(express.urlencoded({ extended: true }));
+
+// Main SMS endpoint connected directly to Twilio
+app.post('/sms', async (req, res) => {
+    // Twilio sends the text message inside a property called 'Body'
+    const title = req.body.Body; 
+    
+    // Set the response type to XML (TwiML) so Twilio understands it
+    res.type('text/xml');
+
+    if (!title || title.trim() === '') {
+        return res.send(`
+            <Response>
+                <Message>Please text a book title to search the library catalog.</Message>
+            </Response>
+        `);
+    }
 
     let browser;
     try {
@@ -17,50 +32,55 @@ app.get('/search', async (req, res) => {
         
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Step 1: Initialize session cookie
         await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 1500));
 
-        // Step 2: Execute Search
-        const searchUrl = `https://catalog.denverlibrary.org/Search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(title)}`;
+        const searchUrl = `https://catalog.denverlibrary.org/Search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(title.trim())}`;
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 3000));
 
-        // Step 3: Extract titles using Regex on the raw page text
         const pageData = await page.evaluate(() => {
-            // Compress all text on the page into a single clean string
             const rawText = document.body.innerText.replace(/\s+/g, ' ');
-            
-            // Look for the pattern: [Number][Dot][Space][TITLE][Space]by[Space]
             const regex = /\b\d+\.\s+(.*?)(?=\s+by\s+)/gi;
             const matches = [];
             let match;
             
-            // Loop through the text and pull out every title that fits the pattern
             while ((match = regex.exec(rawText)) !== null) {
                 if (match[1] && match[1].length > 3) {
                     matches.push(match[1].trim());
                 }
             }
-
-            return {
-                results: Array.from(new Set(matches)).slice(0, 5),
-                debugText: rawText.substring(0, 500)
-            };
+            return Array.from(new Set(matches)).slice(0, 5);
         });
 
         await browser.close();
 
-        if (pageData.results.length > 0) {
-            return res.json({ status: "success", query: title, count: pageData.results.length, results: pageData.results });
+        // Format the results cleanly for a text message
+        let textReply = `No results found for "${title.trim()}".`;
+        if (pageData.length > 0) {
+            textReply = `Top 5 results for "${title.trim()}":\n\n` + pageData.map((book, i) => `${i + 1}. ${book}`).join('\n');
         }
 
-        return res.json({ status: "empty", query: title, message: "Could not parse titles from text.", text: pageData.debugText });
+        // Send the final XML response back to Twilio
+        res.send(`
+            <Response>
+                <Message>${textReply}</Message>
+            </Response>
+        `);
 
     } catch (err) {
         if (browser) await browser.close();
-        return res.status(500).json({ error: err.message });
+        res.send(`
+            <Response>
+                <Message>Sorry, the catalog search failed. Please try again later.</Message>
+            </Response>
+        `);
     }
+});
+
+// A simple status page to check in your browser
+app.get('/', (req, res) => {
+    res.send("DPL Scraper is live and waiting for Twilio webhooks!");
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
