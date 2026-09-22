@@ -8,25 +8,27 @@ app.get('/search', async (req, res) => {
     const title = req.query.title;
     if (!title) return res.json({ error: "No title provided" });
 
-    // Method 1: Direct JSON/HTML Fetch via Axios (Fast & Lightweight)
+    // Correct BiblioCommons Search URL format
+    const searchUrl = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=title`;
+
+    // Method 1: Direct JSON/HTML Fetch via Axios
     try {
-        const url = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
-        const { data: html } = await axios.get(url, {
+        const { data: html } = await axios.get(searchUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             timeout: 10000
         });
 
-        // Extract JSON embedded in NEXT_DATA
         const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">(.*?)<\/script>/s);
         if (match && match[1]) {
             const parsed = JSON.parse(match[1]);
             const bibs = parsed?.props?.pageProps?.initialState?.entities?.bibs || {};
             const results = Object.values(bibs).slice(0, 5).map(item => {
                 const name = item.title || "Unknown Title";
-                const format = item.format || "Item";
-                return `${name} [Format: ${format}]`;
+                const format = item.format || "Book";
+                const availability = item.availability?.status || "Check catalog";
+                return `${name} (${format}) - ${availability}`;
             });
 
             if (results.length > 0) {
@@ -34,7 +36,7 @@ app.get('/search', async (req, res) => {
             }
         }
     } catch (axiosErr) {
-        console.log("Axios fetch failed/bypassed, falling back to Puppeteer...", axiosErr.message);
+        console.log("Axios fetch bypassed, falling back to Puppeteer...", axiosErr.message);
     }
 
     // Method 2: Puppeteer Fallback
@@ -45,15 +47,23 @@ app.get('/search', async (req, res) => {
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         });
         const page = await browser.newPage();
-        
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        const url = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
-        
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300));
-        
+
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+        // Extract title elements from updated search page
+        const results = await page.evaluate(() => {
+            const elements = Array.from(document.querySelectorAll('.cp-title, [data-key="bib-title"]')).slice(0, 5);
+            return elements.map(el => el.innerText.trim());
+        });
+
         await browser.close();
-        return res.json({ status: "success", mode: "puppeteer-fallback", query: title, snippet: bodyText });
+
+        if (results.length > 0) {
+            return res.json({ status: "success", mode: "puppeteer", query: title, results });
+        }
+
+        return res.json({ status: "partial", query: title, note: "Loaded page but found no results for title." });
 
     } catch (err) {
         if (browser) await browser.close();
