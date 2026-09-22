@@ -8,32 +8,33 @@ app.get('/search', async (req, res) => {
     const title = req.query.title;
     if (!title) return res.json({ error: "No title provided" });
 
-    const searchUrl = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
-
-    // Method 1: Try direct embedded JSON state extraction via Axios
+    // Method 1: Query BiblioCommons API directly
     try {
-        const { data: html } = await axios.get(searchUrl, {
+        const apiUrl = `https://denver.bibliocommons.com/v2/bibs/search?query=${encodeURIComponent(title)}&searchType=smart`;
+        const { data } = await axios.get(apiUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/json'
             },
             timeout: 8000
         });
 
-        const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">(.*?)<\/script>/s);
-        if (match && match[1]) {
-            const parsed = JSON.parse(match[1]);
-            const bibs = parsed?.props?.pageProps?.initialState?.entities?.bibs || {};
-            const results = Object.values(bibs).slice(0, 5).map(item => `${item.title} [${item.format || 'Book'}]`);
+        if (data && data.entities && data.entities.bibs) {
+            const results = Object.values(data.entities.bibs).slice(0, 5).map(bib => {
+                const name = bib.title || "Unknown";
+                const format = bib.format || "Book";
+                return `${name} [${format}]`;
+            });
 
             if (results.length > 0) {
-                return res.json({ status: "success", mode: "api", query: title, results });
+                return res.json({ status: "success", mode: "direct-api", query: title, results });
             }
         }
-    } catch (axiosErr) {
-        console.log("Axios API strategy bypassed, moving to Puppeteer...");
+    } catch (apiErr) {
+        console.log("Direct API query failed/bypassed, switching to Puppeteer...");
     }
 
-    // Method 2: Dynamic Chromium DOM Query
+    // Method 2: Puppeteer DOM Scraping with explicit delay
     let browser;
     try {
         browser = await puppeteer.launch({
@@ -41,29 +42,31 @@ app.get('/search', async (req, res) => {
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         });
         const page = await browser.newPage();
+        
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        const searchUrl = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        const results = await page.evaluate(() => {
-            // Broad search selector capturing heading text and links inside result cards
-            const candidates = Array.from(document.querySelectorAll('h2, h3, [data-key="bib-title"], .title-content, .cp-title'));
-            
-            const titles = candidates
-                .map(el => el.innerText.trim())
-                .filter(txt => txt.length > 2 && !txt.toLowerCase().includes('search') && !txt.toLowerCase().includes('filter') && !txt.toLowerCase().includes('catalog'));
+        // Force a 4-second delay for client-side React rendering
+        await new Promise(resolve => setTimeout(resolve, 4000));
 
-            // Deduplicate results
-            return Array.from(new Set(titles)).slice(0, 5);
+        const data = await page.evaluate(() => {
+            // Check for title anchors or elements containing class names with 'title'
+            const links = Array.from(document.querySelectorAll('a'))
+                .map(a => a.innerText.trim())
+                .filter(txt => txt.length > 3 && !txt.toLowerCase().includes('search') && !txt.toLowerCase().includes('log in') && !txt.toLowerCase().includes('menu'));
+
+            return Array.from(new Set(links)).slice(0, 5);
         });
 
         await browser.close();
 
-        if (results.length > 0) {
-            return res.json({ status: "success", mode: "puppeteer", query: title, results });
+        if (data.length > 0) {
+            return res.json({ status: "success", mode: "puppeteer", query: title, results: data });
         }
 
-        return res.json({ status: "partial", query: title, note: "Rendered catalog page successfully, but query returned no titles." });
+        return res.json({ status: "partial", query: title, note: "Loaded catalog page but extracted 0 title links after render delay." });
 
     } catch (err) {
         if (browser) await browser.close();
