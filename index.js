@@ -15,35 +15,43 @@ app.get('/search', async (req, res) => {
         });
         const page = await browser.newPage();
         
-        // Realistic desktop user agent to bypass simple headless blocks
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
         const searchUrl = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Wait 3 seconds for React hydration to fill search card elements
+        // Wait 3 seconds for React hydration
         await new Promise(resolve => setTimeout(resolve, 3000));
 
-        const extracted = await page.evaluate(() => {
-            // Find all anchor links referencing catalog item URLs
-            const itemLinks = Array.from(document.querySelectorAll('a[href*="/item/show/"]'));
+        const pageData = await page.evaluate(() => {
+            // Broadest possible selector for BiblioCommons titles
+            const itemLinks = Array.from(document.querySelectorAll('.title-content, [data-key="bib-title"], .cp-title'));
             
-            const results = itemLinks.map(link => {
-                const text = link.innerText.trim();
-                return text;
-            }).filter(text => text.length > 1 && !text.toLowerCase().includes('cover image'));
+            const results = itemLinks.map(link => link.innerText.trim())
+                .filter(text => text.length > 2);
 
-            // Deduplicate items
-            return Array.from(new Set(results)).slice(0, 5);
+            // If nothing is found, grab the first 1000 characters of the page text so we can see what is blocking us
+            const rawText = document.body.innerText.replace(/\s+/g, ' ').substring(0, 1000);
+
+            return {
+                results: Array.from(new Set(results)).slice(0, 5),
+                debugText: rawText
+            };
         });
 
         await browser.close();
 
-        if (extracted.length > 0) {
-            return res.json({ status: "success", query: title, count: extracted.length, results: extracted });
+        if (pageData.results.length > 0) {
+            return res.json({ status: "success", query: title, results: pageData.results });
         }
 
-        return res.json({ status: "empty", query: title, message: "Page loaded, but no item links matched /item/show/ criteria." });
+        // X-Ray Output: See what the bot is actually looking at
+        return res.json({ 
+            status: "x-ray-debug", 
+            query: title, 
+            message: "No titles found. Here is what the page actually says:",
+            pageContent: pageData.debugText 
+        });
 
     } catch (err) {
         if (browser) await browser.close();
