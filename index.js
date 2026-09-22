@@ -17,22 +17,28 @@ app.get('/search', async (req, res) => {
         
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Navigate directly to the DPL catalog search results page
+        // Step 1: Visit the homepage to initialize the Clarivate/Polaris session cookie
+        await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        
+        // Wait a brief moment for the server to assign our session
+        await new Promise(resolve => setTimeout(resolve, 1500));
+
+        // Step 2: Now that we have a valid session, execute the search URL
         const searchUrl = `https://catalog.denverlibrary.org/Search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(title)}`;
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Wait 3 seconds for the catalog database to populate the results
+        // Wait 3 seconds for the catalog database to render the results
         await new Promise(resolve => setTimeout(resolve, 3000));
 
         const pageData = await page.evaluate(() => {
-            // Target standard title classes used in this catalog system
-            const itemLinks = Array.from(document.querySelectorAll('.title, .title-content, h2, h3, a.record-title, .nsm-brief-primary-title-group'));
+            // Target Polaris-specific title CSS classes
+            const itemLinks = Array.from(document.querySelectorAll('.c-results__item-title a, a[title*="Title"], .record-title, .title-content, h2, h3'));
             
             const results = itemLinks
                 .map(link => link.innerText.trim())
                 .filter(text => text.length > 2 && !text.toLowerCase().includes('search'));
 
-            // X-Ray Output just in case the classes don't match
+            // X-Ray Output just in case
             const rawText = document.body.innerText.replace(/\s+/g, ' ').substring(0, 1000);
 
             return {
@@ -51,7 +57,7 @@ app.get('/search', async (req, res) => {
         return res.json({ 
             status: "x-ray-debug", 
             query: title, 
-            message: "Search executed, but no specific titles found. Here is the page text:",
+            message: "Session established, but no titles found. X-Ray text:",
             pageContent: pageData.debugText 
         });
 
