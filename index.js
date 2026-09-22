@@ -17,10 +17,8 @@ app.get('/search', async (req, res) => {
         
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Step 1: Visit the homepage to initialize the Clarivate/Polaris session cookie
+        // Step 1: Visit the homepage to initialize the Polaris session cookie
         await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-        
-        // Wait a brief moment for the server to assign our session
         await new Promise(resolve => setTimeout(resolve, 1500));
 
         // Step 2: Now that we have a valid session, execute the search URL
@@ -31,14 +29,22 @@ app.get('/search', async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 3000));
 
         const pageData = await page.evaluate(() => {
-            // Target Polaris-specific title CSS classes
-            const itemLinks = Array.from(document.querySelectorAll('.c-results__item-title a, a[title*="Title"], .record-title, .title-content, h2, h3'));
+            // Target Polaris item links (they usually contain 'details' in the href)
+            // or rely on specific table classes they use for short items
+            let itemLinks = Array.from(document.querySelectorAll('a[href*="details"], a.title, .nsm-short-item a'));
             
-            const results = itemLinks
+            let results = itemLinks
                 .map(link => link.innerText.trim())
-                .filter(text => text.length > 2 && !text.toLowerCase().includes('search'));
+                .filter(text => text.length > 5 && !text.toLowerCase().includes('details') && !text.toLowerCase().includes('place hold'));
 
-            // X-Ray Output just in case
+            // Fallback: If specific attributes fail, grab any large anchor tag that looks like a book title
+            if (results.length === 0) {
+                const allLinks = Array.from(document.querySelectorAll('a'));
+                results = allLinks
+                    .map(a => a.innerText.trim())
+                    .filter(text => text.length > 15 && !text.toLowerCase().includes('account') && !text.toLowerCase().includes('search'));
+            }
+
             const rawText = document.body.innerText.replace(/\s+/g, ' ').substring(0, 1000);
 
             return {
@@ -57,7 +63,7 @@ app.get('/search', async (req, res) => {
         return res.json({ 
             status: "x-ray-debug", 
             query: title, 
-            message: "Session established, but no titles found. X-Ray text:",
+            message: "Session established, but exact title links were hidden. X-Ray text:",
             pageContent: pageData.debugText 
         });
 
