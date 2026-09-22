@@ -17,20 +17,34 @@ app.get('/search', async (req, res) => {
         
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        const searchUrl = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
-        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // Step 1: Go to the Denver Public Library Catalog homepage
+        await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Wait 3 seconds for React hydration
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Step 2: Find the search box dynamically, type the title, and hit Enter
+        const searchInput = await page.$('input[name="search"], input[name="q"], input[name="term"], input[type="search"], input[title*="Search"], input[title*="search"]');
+        
+        if (!searchInput) {
+            const rawHtml = await page.evaluate(() => document.body.innerText.replace(/\s+/g, ' ').substring(0, 500));
+            await browser.close();
+            return res.json({ status: "error", message: "Could not find the search box on the DPL homepage.", debug: rawHtml });
+        }
 
+        await searchInput.type(title);
+        await searchInput.press('Enter');
+
+        // Wait for the search results page to load
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+
+        // Step 3: Scrape the titles from the search results
         const pageData = await page.evaluate(() => {
-            // Broadest possible selector for BiblioCommons titles
-            const itemLinks = Array.from(document.querySelectorAll('.title-content, [data-key="bib-title"], .cp-title'));
+            // Target common title formats used in classic catalogs
+            const itemLinks = Array.from(document.querySelectorAll('.title, .title-content, h2, h3, a.record-title'));
             
-            const results = itemLinks.map(link => link.innerText.trim())
-                .filter(text => text.length > 2);
+            const results = itemLinks
+                .map(link => link.innerText.trim())
+                .filter(text => text.length > 2 && !text.toLowerCase().includes('search'));
 
-            // If nothing is found, grab the first 1000 characters of the page text so we can see what is blocking us
+            // X-Ray Output just in case
             const rawText = document.body.innerText.replace(/\s+/g, ' ').substring(0, 1000);
 
             return {
@@ -45,11 +59,11 @@ app.get('/search', async (req, res) => {
             return res.json({ status: "success", query: title, results: pageData.results });
         }
 
-        // X-Ray Output: See what the bot is actually looking at
+        // If no classes match, return the X-Ray debug text
         return res.json({ 
             status: "x-ray-debug", 
             query: title, 
-            message: "No titles found. Here is what the page actually says:",
+            message: "Search executed, but no specific titles found. Here is the page text:",
             pageContent: pageData.debugText 
         });
 
