@@ -7,6 +7,33 @@ app.get('/search', async (req, res) => {
     const title = req.query.title;
     if (!title) return res.json({ error: "No title provided" });
 
+    // Method 1: Fast direct API query to BiblioCommons
+    try {
+        const apiUrl = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
+        const apiResponse = await fetch(apiUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            }
+        });
+        const html = await apiResponse.text();
+
+        // Extract JSON payload embedded inside the HTML page state
+        const jsonMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">(.*?)<\/script>/s);
+        if (jsonMatch && jsonMatch[1]) {
+            const pageData = JSON.parse(jsonMatch[1]);
+            const entities = pageData?.props?.pageProps?.initialState?.entities?.bibs || {};
+            const results = Object.values(entities).slice(0, 5).map(bib => `${bib.title} [Format: ${bib.format}]`);
+            
+            if (results.length > 0) {
+                return res.json({ source: "direct-api", query: title, results });
+            }
+        }
+    } catch (apiErr) {
+        console.log("API strategy bypass failed, falling back to Puppeteer...", apiErr.message);
+    }
+
+    // Method 2: Stealth Puppeteer Browser Fallback
     let browser;
     try {
         browser = await puppeteer.launch({
@@ -15,41 +42,27 @@ app.get('/search', async (req, res) => {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--window-size=1280,800'
             ]
         });
         const page = await browser.newPage();
-        
+
+        // Extra stealth overrides
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
+        await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
         const url = `https://denver.bibliocommons.com/v2/search?query=${encodeURIComponent(title)}&searchType=smart`;
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Wait for results container or list item
-        await page.waitForSelector('.cp-search-result-item, .cp-batch-actions-list-item, [data-key="bib-title"]', { timeout: 20000 });
-
-        const results = await page.evaluate(() => {
-            // Target search result cards flexibly
-            const items = Array.from(document.querySelectorAll('.cp-search-result-item, .cp-batch-actions-list-item')).slice(0, 3);
-            
-            if (items.length === 0) {
-                // Fallback extraction if container classes changed
-                const titles = Array.from(document.querySelectorAll('[data-key="bib-title"]')).slice(0, 3);
-                return titles.map(t => t.innerText.trim());
-            }
-
-            return items.map(item => {
-                const titleEl = item.querySelector('.cp-title, [data-key="bib-title"]');
-                const availEl = item.querySelector('.cp-availability-status, .cp-availability');
-                
-                const t = titleEl ? titleEl.innerText.trim() : "Unknown Title";
-                const a = availEl ? availEl.innerText.trim() : "Status Unknown";
-                return `${t} [${a}]`;
-            });
-        });
-
+        // Grab full page HTML or body text to debug raw output
+        const pageText = await page.evaluate(() => document.body.innerText);
         await browser.close();
-        return res.json({ query: title, results });
+
+        return res.json({ 
+            query: title, 
+            snippet: pageText.substring(0, 500).replace(/\s+/g, ' ') 
+        });
 
     } catch (err) {
         if (browser) await browser.close();
