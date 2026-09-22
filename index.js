@@ -17,39 +17,32 @@ app.get('/search', async (req, res) => {
         
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Step 1: Visit the homepage to initialize the Polaris session cookie
+        // Step 1: Initialize session cookie
         await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 1500));
 
-        // Step 2: Now that we have a valid session, execute the search URL
+        // Step 2: Search
         const searchUrl = `https://catalog.denverlibrary.org/Search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(title)}`;
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        // Wait 3 seconds for the catalog database to render the results
         await new Promise(resolve => setTimeout(resolve, 3000));
 
         const pageData = await page.evaluate(() => {
-            // Target Polaris item links (they usually contain 'details' in the href)
-            // or rely on specific table classes they use for short items
-            let itemLinks = Array.from(document.querySelectorAll('a[href*="details"], a.title, .nsm-short-item a'));
+            const allLinks = Array.from(document.querySelectorAll('a'));
             
-            let results = itemLinks
-                .map(link => link.innerText.trim())
-                .filter(text => text.length > 5 && !text.toLowerCase().includes('details') && !text.toLowerCase().includes('place hold'));
-
-            // Fallback: If specific attributes fail, grab any large anchor tag that looks like a book title
-            if (results.length === 0) {
-                const allLinks = Array.from(document.querySelectorAll('a'));
-                results = allLinks
-                    .map(a => a.innerText.trim())
-                    .filter(text => text.length > 15 && !text.toLowerCase().includes('account') && !text.toLowerCase().includes('search'));
-            }
-
-            const rawText = document.body.innerText.replace(/\s+/g, ' ').substring(0, 1000);
+            // List of words that appear in junk links, buttons, and authors
+            const junkWords = [
+                'author', 'adapter', 'available', 'click here', 'excerpt', 
+                'search', 'account', 'log in', 'holds', 'fees', 'saved', 
+                'sign in', 'help', 'details', 'place hold', 'my list', 'checkout'
+            ];
+            
+            let titles = allLinks
+                .map(a => a.innerText.replace(/\s+/g, ' ').trim())
+                .filter(text => text.length > 5) // Ignore empty or tiny links
+                .filter(text => !junkWords.some(junk => text.toLowerCase().includes(junk)));
 
             return {
-                results: Array.from(new Set(results)).slice(0, 5),
-                debugText: rawText
+                results: Array.from(new Set(titles)).slice(0, 5)
             };
         });
 
@@ -59,13 +52,7 @@ app.get('/search', async (req, res) => {
             return res.json({ status: "success", query: title, results: pageData.results });
         }
 
-        // X-Ray Debug output
-        return res.json({ 
-            status: "x-ray-debug", 
-            query: title, 
-            message: "Session established, but exact title links were hidden. X-Ray text:",
-            pageContent: pageData.debugText 
-        });
+        return res.json({ status: "empty", query: title, message: "No clean titles found after filtering." });
 
     } catch (err) {
         if (browser) await browser.close();
