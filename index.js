@@ -104,7 +104,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     const setupMessage = {
       setup: {
-        model: 'models/gemini-3.8-live', 
+        model: 'models/gemini-2.0-flash-exp-0827', 
         systemInstruction: {
           parts: [{
             text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
@@ -209,6 +209,7 @@ wss.on('connection', async (twilioWs, req) => {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
+          console.log(`[Gemini] Transcoding and dropping ${geminiBytes.length} bytes into holding tank.`);
           
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
@@ -240,7 +241,8 @@ wss.on('connection', async (twilioWs, req) => {
         break;
 
       case 'media':
-        if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady && twilioOutboundBuffer.length === 0) {
+        // THE FIX: Half-Duplex Mute that safely unlocks when buffer drops below 1 Twilio frame (<160 bytes)
+        if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady && twilioOutboundBuffer.length < 160) {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
 
@@ -287,9 +289,8 @@ wss.on('connection', async (twilioWs, req) => {
              }));
           }
         } else {
-           // THE QA FIX: Vaporize any stray leftover bytes so the microphone unlocks
            isBufferPrimed = false; 
-           twilioOutboundBuffer = Buffer.alloc(0); 
+           // THE FIX: Removed Buffer.alloc(0) so we stop chopping words in half.
         }
         break;
         
