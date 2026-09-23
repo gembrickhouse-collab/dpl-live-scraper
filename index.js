@@ -83,10 +83,9 @@ wss.on('connection', async (twilioWs, req) => {
 
   let streamSid = null;
   let isGeminiReady = false;
-  let hasGeminiSpoken = false; // THE FIX: Protects the initial greeting from background noise
+  let hasGeminiSpoken = false; 
   let audioBuffer = []; 
   let twilioOutboundBuffer = Buffer.alloc(0); 
-  let isBufferPrimed = false;
 
   let pastMemoriesArray = [];
   try {
@@ -171,7 +170,6 @@ wss.on('connection', async (twilioWs, req) => {
     if (response.serverContent?.interrupted) {
       console.log('Gemini detected user interruption. Clearing audio buffer.');
       twilioOutboundBuffer = Buffer.alloc(0);
-      isBufferPrimed = false;
       return;
     }
 
@@ -209,7 +207,7 @@ wss.on('connection', async (twilioWs, req) => {
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
-          hasGeminiSpoken = true; // The AI has officially started speaking, safe to unlock mic soon
+          hasGeminiSpoken = true; 
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
           console.log(`[Gemini] Transcoding and dropping ${geminiBytes.length} bytes into holding tank.`);
           
@@ -243,7 +241,6 @@ wss.on('connection', async (twilioWs, req) => {
         break;
 
       case 'media':
-        // THE FIX: Strict walkie-talkie lock. Mic only opens if Gemini has finished its forced greeting AND is silent.
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady && hasGeminiSpoken && twilioOutboundBuffer.length < 160) {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
@@ -268,31 +265,17 @@ wss.on('connection', async (twilioWs, req) => {
           }
         }
 
+        // THE FIX: Soft Prime payload inflation. Dynamically pull up to 320 bytes (40ms) per single message.
         if (streamSid && twilioOutboundBuffer.length >= 160) {
-          if (!isBufferPrimed) {
-             const primeFrames = Math.min(25, Math.floor(twilioOutboundBuffer.length / 160));
-             for (let i = 0; i < primeFrames; i++) {
-                const frame = twilioOutboundBuffer.subarray(0, 160);
-                twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
-                twilioWs.send(JSON.stringify({
-                  event: 'media',
-                  streamSid: streamSid,
-                  media: { payload: frame.toString('base64') }
-                }));
-             }
-             isBufferPrimed = true;
-          } else {
-             const frame = twilioOutboundBuffer.subarray(0, 160);
-             twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
-             twilioWs.send(JSON.stringify({
-                event: 'media',
-                streamSid: streamSid,
-                media: { payload: frame.toString('base64') }
-             }));
-          }
-        } else {
-           isBufferPrimed = false; 
-           // Leftover non-160 byte frames safely sit here without triggering a deletion.
+          const chunkSize = Math.min(twilioOutboundBuffer.length, 320);
+          const frame = twilioOutboundBuffer.subarray(0, chunkSize);
+          twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(chunkSize));
+          
+          twilioWs.send(JSON.stringify({
+            event: 'media',
+            streamSid: streamSid,
+            media: { payload: frame.toString('base64') }
+          }));
         }
         break;
         
