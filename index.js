@@ -19,7 +19,7 @@ app.post('/sms', async (req, res) => {
   console.log(`Incoming SMS: ${userMessage}`);
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-3.6-flash" });
     const result = await model.generateContent(userMessage);
     const responseText = result.response.text();
 
