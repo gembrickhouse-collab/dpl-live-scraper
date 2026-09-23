@@ -131,7 +131,6 @@ wss.on('connection', async (twilioWs, req) => {
     try {
       response = JSON.parse(data);
     } catch (err) {
-      console.error('Failed to parse Gemini response JSON:', err);
       return;
     }
 
@@ -141,7 +140,7 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
-    // FUNCTION CALL HANDLING
+    // --- FUNCTION CALL HANDLING ---
     if (response.toolCall) {
       const calls = response.toolCall.functionCalls || [];
       const functionResponses = [];
@@ -158,52 +157,42 @@ wss.on('connection', async (twilioWs, req) => {
               response: { status: 'Success. Fact saved permanently.' }
             });
           } catch (err) {
-            console.error('Redis save failure:', err);
-            functionResponses.push({
-              id: call.id,
-              name: call.name,
-              response: { error: 'Failed to write to database.' }
-            });
+            functionResponses.push({ id: call.id, name: call.name, response: { error: 'Database fail.' } });
           }
         } else if (call.name === 'get_weather') {
           const location = call.args.location;
-          let forecast = `Weather information for ${location} is currently unavailable.`;
+          console.log(`Gemini requested weather for: ${location}`); 
+          let forecast = `Weather information for ${location} is unavailable.`;
           try {
             const res = await fetch(`https://wttr.in/${encodeURIComponent(location)}?format=%C,+%t+(Feels+like+%f),+Wind:+%w`);
             if (res.ok) {
               const text = await res.text();
               forecast = `Current conditions for ${location}: ${text.trim()}`;
             }
-          } catch (err) {
-            console.error('Weather fetch failure:', err);
-          }
-
-          functionResponses.push({
-            id: call.id,
-            name: call.name,
-            response: { forecast }
-          });
+          } catch (err) {}
+          functionResponses.push({ id: call.id, name: call.name, response: { forecast } });
         }
       }
 
-      geminiWs.send(JSON.stringify({
-        toolResponse: { functionResponses }
-      }));
+      geminiWs.send(JSON.stringify({ toolResponse: { functionResponses } }));
       return;
     }
 
-    // AUDIO OUTPUT (Gemini -> Twilio)
+    // --- AUDIO OUTPUT (Gemini -> Twilio) ---
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           try {
+            const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
+            // THE FIX: Explicitly cast the raw bytes into a 16-bit array
+            const geminiSamples = new Int16Array(geminiBytes.buffer, geminiBytes.byteOffset, geminiBytes.byteLength / 2);
+            
             const wav = new WaveFile();
-            wav.fromScratch(1, 24000, '16', Buffer.from(part.inlineData.data, 'base64'));
+            wav.fromScratch(1, 24000, '16', geminiSamples);
             wav.toSampleRate(8000);
             wav.toMuLaw();
 
             const twilioPayload = Buffer.from(wav.data.samples).toString('base64');
-
             if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({
                 event: 'media',
@@ -212,59 +201,48 @@ wss.on('connection', async (twilioWs, req) => {
               }));
             }
           } catch (err) {
-            console.error('Gemini -> Twilio audio transcoding error:', err);
+            console.error('Gemini -> Twilio Transcoding Error:', err);
           }
         }
       }
     }
   });
 
-  geminiWs.on('error', (err) => {
-    console.error('Gemini WebSocket error:', err);
-  });
+  geminiWs.on('error', (err) => console.error('Gemini error:', err));
 
-  // AUDIO INPUT (Twilio -> Gemini)
+  // --- AUDIO INPUT (Twilio -> Gemini) ---
   twilioWs.on('message', (message) => {
     let msg;
-    try {
-      msg = JSON.parse(message);
-    } catch (err) {
-      return;
-    }
+    try { msg = JSON.parse(message); } catch (err) { return; }
 
     switch (msg.event) {
       case 'start':
         streamSid = msg.start.streamSid;
-        console.log(`Stream active: ${streamSid}`);
         break;
 
       case 'media':
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
           try {
+            const twilioBytes = Buffer.from(msg.media.payload, 'base64');
             const wav = new WaveFile();
-            wav.fromScratch(1, 8000, '8m', Buffer.from(msg.media.payload, 'base64'));
+            wav.fromScratch(1, 8000, '8m', twilioBytes);
             wav.fromMuLaw();
             wav.toSampleRate(16000);
+            wav.toBitDepth('16'); // THE FIX: Force conversion to 16-bit depth
 
             const pcmData = new Int16Array(wav.data.samples);
             const geminiPayload = Buffer.from(pcmData.buffer).toString('base64');
 
             geminiWs.send(JSON.stringify({
               realtimeInput: {
-                mediaChunks: [{
-                  mimeType: 'audio/pcm;rate=16000',
-                  data: geminiPayload
-                }]
+                mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: geminiPayload }]
               }
             }));
-          } catch (err) {
-            console.error('Twilio -> Gemini audio transcoding error:', err);
-          }
+          } catch (err) {}
         }
         break;
-
+        
       case 'stop':
-        console.log(`Call ended: ${streamSid}`);
         if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
         break;
     }
@@ -272,10 +250,6 @@ wss.on('connection', async (twilioWs, req) => {
 
   twilioWs.on('close', () => {
     if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-  });
-
-  geminiWs.on('close', (code, reason) => {
-    console.log(`Gemini session closed. Code: ${code}, Reason: ${reason}`);
   });
 });
 
