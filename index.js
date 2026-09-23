@@ -3,15 +3,10 @@ const puppeteer = require('puppeteer-core');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Allow Express to read the URL-encoded POST data Twilio sends
 app.use(express.urlencoded({ extended: true }));
 
-// Main SMS endpoint connected directly to Twilio
 app.post('/sms', async (req, res) => {
-    // Twilio sends the text message inside a property called 'Body'
     const title = req.body.Body; 
-    
-    // Set the response type to XML (TwiML) so Twilio understands it
     res.type('text/xml');
 
     if (!title || title.trim() === '') {
@@ -41,13 +36,27 @@ app.post('/sms', async (req, res) => {
 
         const pageData = await page.evaluate(() => {
             const rawText = document.body.innerText.replace(/\s+/g, ' ');
-            const regex = /\b\d+\.\s+(.*?)(?=\s+by\s+)/gi;
-            const matches = [];
-            let match;
             
-            while ((match = regex.exec(rawText)) !== null) {
-                if (match[1] && match[1].length > 3) {
-                    matches.push(match[1].trim());
+            // Split the page text into chunks right before every number (e.g., "1. ", "2. ")
+            const chunks = rawText.split(/(?=\b\d+\.\s+)/);
+            const matches = [];
+            
+            for (const chunk of chunks) {
+                // Ensure this chunk is actually a numbered list item
+                if (/^\d+\.\s+/.test(chunk)) {
+                    // Grab the title between the number and the word "by"
+                    const titleMatch = chunk.match(/^\d+\.\s+(.*?)(?=\s+by\s+)/i);
+                    
+                    if (titleMatch && titleMatch[1]) {
+                        const bookTitle = titleMatch[1].trim();
+                        
+                        // Grab the exact phrase "Available Copies: X (of Y)" from the same chunk
+                        const copiesMatch = chunk.match(/(Available Copies:\s*\d+\s*\(of\s*\d+\))/i);
+                        const availability = copiesMatch ? copiesMatch[1] : "Availability unknown";
+                        
+                        // Combine them into a single line
+                        matches.push(`${bookTitle} - ${availability}`);
+                    }
                 }
             }
             return Array.from(new Set(matches)).slice(0, 5);
@@ -55,13 +64,11 @@ app.post('/sms', async (req, res) => {
 
         await browser.close();
 
-        // Format the results cleanly for a text message
         let textReply = `No results found for "${title.trim()}".`;
         if (pageData.length > 0) {
-            textReply = `Top 5 results for "${title.trim()}":\n\n` + pageData.map((book, i) => `${i + 1}. ${book}`).join('\n');
+            textReply = `Top 5 results for "${title.trim()}":\n\n` + pageData.map((book, i) => `${i + 1}. ${book}`).join('\n\n');
         }
 
-        // Send the final XML response back to Twilio
         res.send(`
             <Response>
                 <Message>${textReply}</Message>
@@ -78,7 +85,6 @@ app.post('/sms', async (req, res) => {
     }
 });
 
-// A simple status page to check in your browser
 app.get('/', (req, res) => {
     res.send("DPL Scraper is live and waiting for Twilio webhooks!");
 });
