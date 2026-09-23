@@ -28,6 +28,10 @@ async function scrapeDPL(query) {
     const searchUrl = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
     
+    // NEW: Force the browser to wait 3 extra seconds to let live inventory numbers populate
+    console.log("Waiting 3 seconds for live inventory to load...");
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
     // THE AVAILABILITY INSPECTOR
     const diagnosticData = await page.evaluate(() => {
       const firstTitle = document.querySelector('.nsm-brief-action-link');
@@ -61,7 +65,7 @@ async function scrapeDPL(query) {
 
     await browser.close();
 
-    return `Availability diagnostic complete for "${cleanQuery}". Check the Render logs!`;
+    return `Inventory diagnostic complete for "${cleanQuery}". Check the Render logs!`;
   } catch (error) {
     if (browser) await browser.close();
     console.error("Scraper error:", error.message);
