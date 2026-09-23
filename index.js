@@ -28,26 +28,40 @@ async function scrapeDPL(query) {
     const searchUrl = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
     
-    const results = await page.evaluate(() => {
-      let titles = [];
-      // TARGET ACQUIRED: Using the exact class revealed in our Render logs
-      const elements = document.querySelectorAll('.nsm-brief-action-link');
+    // THE AVAILABILITY INSPECTOR
+    const diagnosticData = await page.evaluate(() => {
+      const firstTitle = document.querySelector('.nsm-brief-action-link');
+      if (!firstTitle) return "No titles found.";
+
+      // Go up 4 levels to grab the whole "book card" container
+      let container = firstTitle.parentElement;
+      for (let i = 0; i < 4; i++) {
+        if (container.parentElement) container = container.parentElement;
+      }
+
+      // Map out every class and the text inside it for this specific book
+      let elementsMap = [];
+      const elements = container.querySelectorAll('*');
       for (let el of elements) {
-        const text = el.innerText.trim().replace(/\s+/g, ' ');
-        if (text && !titles.includes(text) && titles.length < 3) {
-          titles.push(text);
+        if (el.className && typeof el.className === 'string') {
+          const text = el.innerText ? el.innerText.trim().replace(/\n/g, ' ').substring(0, 60) : '';
+          // Filter out massive wrapper elements to keep the log clean
+          if (text.length > 0 && text.length < 60) { 
+             elementsMap.push(`[CLASS: ${el.className.trim()}] TEXT: ${text}`);
+          }
         }
       }
-      return titles;
+      
+      return `--- RAW CARD TEXT ---\n${container.innerText.substring(0, 300)}\n\n--- CLASS MAP ---\n${[...new Set(elementsMap)].join('\n')}`;
     });
+
+    console.log(`\n--- AVAILABILITY DIAGNOSTIC ---`);
+    console.log(diagnosticData);
+    console.log(`-------------------------------\n`);
 
     await browser.close();
 
-    if (results.length === 0) {
-      return `No results found for "${cleanQuery}" at the Denver Public Library.`;
-    }
-
-    return `DPL Results for "${cleanQuery}":\n\n1. ${results[0] || ''}\n2. ${results[1] || ''}\n3. ${results[2] || ''}`;
+    return `Availability diagnostic complete for "${cleanQuery}". Check the Render logs!`;
   } catch (error) {
     if (browser) await browser.close();
     console.error("Scraper error:", error.message);
@@ -67,7 +81,7 @@ app.post('/sms', async (req, res) => {
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       to: userPhoneNumber
     });
-    console.log("Library results sent successfully!");
+    console.log("Diagnostic message sent successfully!");
   } catch (error) {
     console.error("Failed to send message via Twilio:", error);
   }
