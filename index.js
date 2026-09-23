@@ -84,6 +84,8 @@ wss.on('connection', async (twilioWs, req) => {
   let streamSid = null;
   let isGeminiReady = false;
   let audioBuffer = []; 
+  let twilioOutboundBuffer = Buffer.alloc(0); 
+  let isBufferPrimed = false; // THE FIX: Tracks if Twilio has a safe cushion
 
   let pastMemoriesArray = [];
   try {
@@ -165,6 +167,13 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
+    if (response.serverContent?.interrupted) {
+      console.log('Gemini detected user interruption. Clearing audio buffer.');
+      twilioOutboundBuffer = Buffer.alloc(0);
+      isBufferPrimed = false; // Reset the cushion
+      return;
+    }
+
     if (response.toolCall) {
       const calls = response.toolCall.functionCalls || [];
       const functionResponses = [];
@@ -201,9 +210,8 @@ wss.on('connection', async (twilioWs, req) => {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-          console.log(`[Gemini] Transcoding and forwarding ${geminiBytes.length} bytes of raw audio.`);
+          console.log(`[Gemini] Transcoding ${geminiBytes.length} bytes of raw audio.`);
           
-          // Downsample 24kHz -> 8kHz manually, avoiding library overhead
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
           for (let i = 0; i < geminiBytes.length; i += 6) {
@@ -212,13 +220,7 @@ wss.on('connection', async (twilioWs, req) => {
             muLawBuffer[outIdx++] = pcmToMuLaw(pcm16);
           }
 
-          if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: { payload: muLawBuffer.toString('base64') }
-            }));
-          }
+          twilioOutboundBuffer = Buffer.concat([twilioOutboundBuffer, muLawBuffer]);
         }
       }
     }
@@ -259,6 +261,35 @@ wss.on('connection', async (twilioWs, req) => {
               }
             }));
           }
+        }
+        
+        // --- THE FIX: JITTER BUFFER PRIMING ---
+        if (streamSid && twilioOutboundBuffer.length >= 160) {
+          if (!isBufferPrimed) {
+             // Inject a rapid burst of 5 frames (100ms) to safely fill Twilio's jitter buffer
+             const primeFrames = Math.min(5, Math.floor(twilioOutboundBuffer.length / 160));
+             for (let i = 0; i < primeFrames; i++) {
+                const frame = twilioOutboundBuffer.subarray(0, 160);
+                twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
+                twilioWs.send(JSON.stringify({
+                  event: 'media',
+                  streamSid: streamSid,
+                  media: { payload: frame.toString('base64') }
+                }));
+             }
+             isBufferPrimed = true;
+          } else {
+             // Coast smoothly at exactly 1 frame per 20ms tick
+             const frame = twilioOutboundBuffer.subarray(0, 160);
+             twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
+             twilioWs.send(JSON.stringify({
+                event: 'media',
+                streamSid: streamSid,
+                media: { payload: frame.toString('base64') }
+             }));
+          }
+        } else {
+           isBufferPrimed = false; 
         }
         break;
         
