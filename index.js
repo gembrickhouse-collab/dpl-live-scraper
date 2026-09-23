@@ -10,8 +10,6 @@ const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TO
 
 async function scrapeDPL(query) {
   const cleanQuery = query.trim();
-  const url = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
-  
   let browser;
   try {
     browser = await puppeteer.launch({
@@ -23,14 +21,15 @@ async function scrapeDPL(query) {
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
     
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
+    // STEP 1: Visit the homepage first to establish a secure session cookie
+    console.log("Establishing session with library server...");
+    await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 20000 });
     
-    // NEW: Extract all visible text on the page to see what the browser is actually looking at
-    const pageText = await page.evaluate(() => document.body.innerText);
-    console.log(`--- VISIBLE PAGE TEXT FOR "${cleanQuery}" ---`);
-    console.log(pageText.substring(0, 1500)); 
-    console.log(`-------------------------------------------`);
-
+    // STEP 2: Navigate to the actual search results now that the server trusts us
+    console.log(`Searching for: ${cleanQuery}`);
+    const searchUrl = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
+    await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+    
     const results = await page.evaluate(() => {
       let titles = [];
       const elements = document.querySelectorAll('.ns-title, a[id*="Title"], a[id*="title"]');
