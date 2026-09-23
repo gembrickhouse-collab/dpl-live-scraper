@@ -66,10 +66,10 @@ app.post('/voice', (req, res) => {
   twiml.say({ voice: 'Polly.Joanna' }, "Connecting to Gemini Live.");
 
   const connect = twiml.connect();
-  // CRITICAL FIX: Twilio streams are read-only by default. We must explicitly enable both tracks.
+  // REVERTED: Bidirectional streams natively support both directions, 
+  // but explicitly requesting 'both_tracks' causes a fatal TwiML crash.
   connect.stream({
-    url: `wss://${req.get('host')}/stream?caller=${encodeURIComponent(callerId)}`,
-    track: 'both_tracks' 
+    url: `wss://${req.get('host')}/stream?caller=${encodeURIComponent(callerId)}`
   });
 
   res.type('text/xml');
@@ -210,7 +210,7 @@ wss.on('connection', async (twilioWs, req) => {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-          console.log(`[Gemini] Dropped ${geminiBytes.length} bytes of raw audio into the holding tank.`);
+          console.log(`[Gemini] Transcoding ${geminiBytes.length} bytes of raw audio.`);
           
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
@@ -262,18 +262,17 @@ wss.on('connection', async (twilioWs, req) => {
           }
         }
         
-        // Drain up to 10 frames (200ms) per tick to catch up without overflowing Twilio
-        let framesSent = 0;
-        while (streamSid && twilioOutboundBuffer.length >= 160 && framesSent < 10) {
-          const frame = twilioOutboundBuffer.subarray(0, 160);
-          twilioOutboundBuffer = twilioOutboundBuffer.subarray(160);
+        // Push up to 40ms of audio per Twilio tick to smoothly catch up to Gemini
+        if (streamSid && twilioOutboundBuffer.length > 0) {
+          const chunkSize = Math.min(twilioOutboundBuffer.length, 320); 
+          const frame = twilioOutboundBuffer.subarray(0, chunkSize);
+          twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(chunkSize));
           
           twilioWs.send(JSON.stringify({
             event: 'media',
             streamSid: streamSid,
             media: { payload: frame.toString('base64') }
           }));
-          framesSent++;
         }
         break;
         
