@@ -103,7 +103,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     const setupMessage = {
       setup: {
-        model: 'models/gemini-2.0-flash', 
+        model: 'models/gemini-3.8-live', 
         systemInstruction: {
           parts: [{
             text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
@@ -211,6 +211,7 @@ wss.on('connection', async (twilioWs, req) => {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
+          console.log(`Transcoding ${geminiBytes.length} bytes of audio from Gemini.`);
           
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
