@@ -25,14 +25,15 @@ async function scrapeDPL(query) {
     console.log("Establishing session with library server...");
     await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 20000 });
     
-    // STEP 2: Navigate to the actual search results now that the server trusts us
+    // STEP 2: Navigate to the actual search results
     console.log(`Searching for: ${cleanQuery}`);
     const searchUrl = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
     
     const results = await page.evaluate(() => {
       let titles = [];
-      const elements = document.querySelectorAll('.ns-title, a[id*="Title"], a[id*="title"]');
+      // Target the exact anchor link IDs that Polaris uses for book titles, ignoring the sidebar
+      const elements = document.querySelectorAll('a[id*="lnkTitle"]');
       for (let el of elements) {
         const text = el.innerText.trim().replace(/\s+/g, ' ');
         if (text && !titles.includes(text) && titles.length < 3) {
