@@ -86,21 +86,6 @@ wss.on('connection', async (twilioWs, req) => {
   let audioBuffer = []; 
   let twilioOutboundBuffer = Buffer.alloc(0); 
 
-  // --- THE FIX: AUDIO PACING LOOP ---
-  // Twilio strictly requires 160-byte chunks every 20ms. 
-  setInterval(() => {
-    if (streamSid && twilioWs.readyState === WebSocket.OPEN && twilioOutboundBuffer.length >= 160) {
-      const frame = twilioOutboundBuffer.subarray(0, 160);
-      twilioOutboundBuffer = twilioOutboundBuffer.subarray(160);
-      
-      twilioWs.send(JSON.stringify({
-        event: 'media',
-        streamSid: streamSid,
-        media: { payload: frame.toString('base64') }
-      }));
-    }
-  }, 20);
-
   let pastMemoriesArray = [];
   try {
     const result = await redisCommand('LRANGE', callerId, '0', '-1');
@@ -181,6 +166,13 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
+    // Clear the outbound buffer if Gemini detects the user interrupted it
+    if (response.serverContent?.interrupted) {
+      console.log('Gemini detected user interruption. Clearing audio buffer.');
+      twilioOutboundBuffer = Buffer.alloc(0);
+      return;
+    }
+
     if (response.toolCall) {
       const calls = response.toolCall.functionCalls || [];
       const functionResponses = [];
@@ -217,6 +209,7 @@ wss.on('connection', async (twilioWs, req) => {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
+          console.log(`[Gemini] Dropped ${geminiBytes.length} bytes of raw audio into the holding tank.`);
           
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
@@ -226,7 +219,6 @@ wss.on('connection', async (twilioWs, req) => {
             muLawBuffer[outIdx++] = pcmToMuLaw(pcm16);
           }
 
-          // Push to holding tank instead of sending immediately
           twilioOutboundBuffer = Buffer.concat([twilioOutboundBuffer, muLawBuffer]);
         }
       }
@@ -245,6 +237,7 @@ wss.on('connection', async (twilioWs, req) => {
         break;
 
       case 'media':
+        // 1. Send Twilio's audio up to Gemini
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
@@ -267,6 +260,18 @@ wss.on('connection', async (twilioWs, req) => {
               }
             }));
           }
+        }
+        
+        // 2. THE FIX: Use Twilio's incoming media tick as a perfect 20ms clock to send audio back!
+        if (streamSid && twilioOutboundBuffer.length >= 160) {
+          const frame = twilioOutboundBuffer.subarray(0, 160);
+          twilioOutboundBuffer = twilioOutboundBuffer.subarray(160);
+          
+          twilioWs.send(JSON.stringify({
+            event: 'media',
+            streamSid: streamSid,
+            media: { payload: frame.toString('base64') }
+          }));
         }
         break;
         
