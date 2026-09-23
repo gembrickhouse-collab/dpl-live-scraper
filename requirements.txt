@@ -1,0 +1,3 @@
+pipecat-ai[twilio,google]
+fastapi
+uvicorn
