@@ -105,7 +105,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     const setupMessage = {
       setup: {
-        model: 'models/gemini-2.0-flash-exp', // Restored validated working model string
+        model: 'models/gemini-3.8-live', 
         systemInstruction: {
           parts: [{
             text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
@@ -243,7 +243,6 @@ wss.on('connection', async (twilioWs, req) => {
         break;
 
       case 'media':
-        // TRUE WALKIE-TALKIE LOCK: Mic opens strictly when the AI completes its sentence and tank empties.
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady && hasGeminiSpoken && twilioOutboundBuffer.length === 0) {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
@@ -268,11 +267,9 @@ wss.on('connection', async (twilioWs, req) => {
           }
         }
 
-        // OUTPUT PACING: Sync directly to Twilio's incoming media tick.
         if (streamSid && twilioOutboundBuffer.length >= 160) {
           let sendSize = 160;
           
-          // Inject a single larger base64 payload up to 200ms once to safely prime Twilio's jitter buffer.
           if (!isBufferPrimed) {
             sendSize = Math.min(twilioOutboundBuffer.length, 1600);
             isBufferPrimed = true;
@@ -287,7 +284,7 @@ wss.on('connection', async (twilioWs, req) => {
             media: { payload: frame.toString('base64') }
           }));
         } else if (twilioOutboundBuffer.length === 0) {
-          isBufferPrimed = false; // Reset the prime state for the next AI sentence.
+          isBufferPrimed = false; 
         }
         break;
         
