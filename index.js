@@ -12,7 +12,8 @@ const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TO
 // Denver Public Library Scraping Logic
 async function scrapeDPL(query) {
   try {
-    const url = `https://catalog.denverlibrary.org/Search/Results?lookfor=${encodeURIComponent(query)}&type=AllFields`;
+    // Connect directly to the DPL Polaris search endpoint
+    const url = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(query)}`;
     
     // Add a User-Agent so the library firewall thinks this is a normal person using Chrome
     const { data } = await axios.get(url, {
@@ -23,9 +24,12 @@ async function scrapeDPL(query) {
     const $ = cheerio.load(data);
     
     let results = [];
-    $('.title, .result-title').each((i, el) => {
-      if (i < 3) { 
-        results.push($(el).text().trim().replace(/\s+/g, ' '));
+    
+    // Polaris uses specific classes for its search results
+    $('.ns-title, .title, a[href*="title.aspx"]').each((i, el) => {
+      const titleText = $(el).text().trim().replace(/\s+/g, ' ');
+      if (titleText && !results.includes(titleText) && results.length < 3) { 
+        results.push(titleText);
       }
     });
 
@@ -33,9 +37,9 @@ async function scrapeDPL(query) {
       return `No results found for "${query}" at the Denver Public Library.`;
     }
 
-    return `DPL Results for "${query}":\n\n1. ${results[0] || 'No title extracted'}\n2. ${results[1] || 'No title extracted'}\n3. ${results[2] || 'No title extracted'}`;
+    return `DPL Results for "${query}":\n\n1. ${results[0] || ''}\n2. ${results[1] || ''}\n3. ${results[2] || ''}`;
   } catch (error) {
-    console.error("Scraper error:", error);
+    console.error("Scraper error:", error.message);
     return "Error: Could not reach the library catalog.";
   }
 }
@@ -50,7 +54,7 @@ app.post('/sms', async (req, res) => {
   try {
     const libraryResults = await scrapeDPL(searchQuery); 
 
-    // Send using your A2P-compliant Messaging Service instead of the raw phone number
+    // Send using your A2P-compliant Messaging Service
     await client.messages.create({
       body: libraryResults,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
