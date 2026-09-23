@@ -3,6 +3,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const twilio = require('twilio');
 const { WaveFile } = require('wavefile');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 const server = http.createServer(app);
@@ -11,71 +12,184 @@ const wss = new WebSocket.Server({ server, path: '/stream' });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 1. THE INITIAL CALL HANDLER
+// Connect to Upstash Redis database
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+// 1. INITIAL CALL HANDLER (Twilio hits this first)
 app.post('/voice', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say({ voice: 'Polly.Joanna' }, "Terminal connected. Connecting to Gemini live engine.");
-  
+  const callerId = req.body.From || 'Unknown';
+
+  twiml.say({ voice: 'Polly.Joanna' }, "Connecting to Gemini Live.");
+
   const connect = twiml.connect();
   connect.stream({
-    url: `wss://${req.get('host')}/stream`, 
+    url: `wss://${req.get('host')}/stream?caller=${encodeURIComponent(callerId)}`,
   });
 
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-// 2. THE WEBSOCKET SERVER
-wss.on('connection', (twilioWs) => {
-  console.log('Twilio Media Stream Connected');
-  let streamSid = null;
-  let isGeminiReady = false; // THE FIX: Gatekeeper flag
+// 2. BIDIRECTIONAL STREAM HANDLER
+wss.on('connection', async (twilioWs, req) => {
+  console.log('Twilio Media Stream connected');
 
+  const urlParams = new URLSearchParams(req.url.split('?')[1]);
+  const callerId = urlParams.get('caller') || 'Unknown';
+
+  let streamSid = null;
+  let isGeminiReady = false;
+
+  // Retrieve existing caller memories from Redis
+  let pastMemoriesArray = [];
+  try {
+    pastMemoriesArray = await redis.lrange(callerId, 0, -1);
+  } catch (err) {
+    console.error('Redis memory retrieval error:', err);
+  }
+  const pastMemories = pastMemoriesArray.length > 0
+    ? pastMemoriesArray.join('. ')
+    : 'No previous conversations recorded.';
+
+  // Connect to the Gemini Live multimodal WebSocket
   const geminiUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GEMINI_API_KEY}`;
   const geminiWs = new WebSocket(geminiUrl);
 
   geminiWs.on('open', () => {
-    console.log("Connected to Gemini Live API. Sending setup...");
+    console.log(`Connected to Gemini Live API for ${callerId}`);
+
     const setupMessage = {
       setup: {
-        model: "models/gemini-2.0-flash-exp",
-        generation_config: {
-          response_modalities: ["AUDIO"],
-          speech_config: {
-            voice_config: { prebuilt_voice_config: { voice_name: "Puck" } }
+        model: 'models/gemini-2.0-flash-exp',
+        systemInstruction: {
+          parts: [{
+            text: `You are a helpful, fast voice assistant conversing over a live telephone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, preferences, or details to keep, invoke the save_memory tool. If they ask about current weather or temperatures, invoke the get_weather tool.`
+          }]
+        },
+        tools: [{
+          functionDeclarations: [
+            {
+              name: 'save_memory',
+              description: 'Persist a specific fact about the caller into the database.',
+              parameters: {
+                type: 'object',
+                properties: {
+                  fact: { type: 'string', description: 'The exact fact or note to store.' }
+                },
+                required: ['fact']
+              }
+            },
+            {
+              name: 'get_weather',
+              description: 'Fetch current weather and temperature for a given city or location.',
+              parameters: {
+                type: 'object',
+                properties: {
+                  location: { type: 'string', description: 'The city or area to query (e.g., Denver, CO).' }
+                },
+                required: ['location']
+              }
+            }
+          ]
+        }],
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } }
           }
         }
       }
     };
+
     geminiWs.send(JSON.stringify(setupMessage));
   });
 
-  // 4. HANDLE AUDIO COMING FROM GEMINI -> TWILIO
-  geminiWs.on('message', (data) => {
-    const response = JSON.parse(data);
-    
-    // Check if Gemini finished setting up
+  // Handle messages received from Gemini
+  geminiWs.on('message', async (data) => {
+    let response;
+    try {
+      response = JSON.parse(data);
+    } catch (err) {
+      console.error('Failed to parse Gemini response JSON:', err);
+      return;
+    }
+
     if (response.setupComplete) {
-      console.log("Gemini setup complete! Ready to receive audio.");
+      console.log('Gemini Live session ready for audio exchange.');
       isGeminiReady = true;
       return;
     }
-    
-    if (response.serverContent && response.serverContent.modelTurn) {
-      const parts = response.serverContent.modelTurn.parts;
-      for (let part of parts) {
-        if (part.inlineData && part.inlineData.data) {
+
+    // FUNCTION CALL HANDLING
+    if (response.toolCall) {
+      const calls = response.toolCall.functionCalls || [];
+      const functionResponses = [];
+
+      for (const call of calls) {
+        if (call.name === 'save_memory') {
+          const fact = call.args.fact;
           try {
-            const geminiAudioBase64 = part.inlineData.data;
+            await redis.rpush(callerId, fact);
+            console.log(`Stored fact for ${callerId}: ${fact}`);
+            functionResponses.push({
+              id: call.id,
+              name: call.name,
+              response: { status: 'Success. Fact saved permanently.' }
+            });
+          } catch (err) {
+            console.error('Redis save failure:', err);
+            functionResponses.push({
+              id: call.id,
+              name: call.name,
+              response: { error: 'Failed to write to database.' }
+            });
+          }
+        } else if (call.name === 'get_weather') {
+          const location = call.args.location;
+          let forecast = `Weather information for ${location} is currently unavailable.`;
+          try {
+            // Free weather endpoint requiring no API key
+            const res = await fetch(`https://wttr.in/${encodeURIComponent(location)}?format=%C,+%t+(Feels+like+%f),+Wind:+%w`);
+            if (res.ok) {
+              const text = await res.text();
+              forecast = `Current conditions for ${location}: ${text.trim()}`;
+            }
+          } catch (err) {
+            console.error('Weather fetch failure:', err);
+          }
+
+          functionResponses.push({
+            id: call.id,
+            name: call.name,
+            response: { forecast }
+          });
+        }
+      }
+
+      geminiWs.send(JSON.stringify({
+        toolResponse: { functionResponses }
+      }));
+      return;
+    }
+
+    // AUDIO OUTPUT (Gemini -> Twilio)
+    if (response.serverContent?.modelTurn?.parts) {
+      for (const part of response.serverContent.modelTurn.parts) {
+        if (part.inlineData?.data) {
+          try {
+            // Transcode 24kHz 16-bit PCM down to Twilio's 8kHz 8-bit mu-law
             const wav = new WaveFile();
-            
-            wav.fromScratch(1, 24000, '16', Buffer.from(geminiAudioBase64, 'base64'));
+            wav.fromScratch(1, 24000, '16', Buffer.from(part.inlineData.data, 'base64'));
             wav.toSampleRate(8000);
             wav.toMuLaw();
-            
+
             const twilioPayload = Buffer.from(wav.data.samples).toString('base64');
 
-            if (streamSid) {
+            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({
                 event: 'media',
                 streamSid: streamSid,
@@ -83,73 +197,75 @@ wss.on('connection', (twilioWs) => {
               }));
             }
           } catch (err) {
-            console.error("Transcoding error (Gemini -> Twilio):", err);
+            console.error('Gemini -> Twilio audio transcoding error:', err);
           }
         }
       }
     }
   });
 
-  geminiWs.on('error', (error) => {
-    console.error("CRITICAL GEMINI ERROR:", error);
+  geminiWs.on('error', (err) => {
+    console.error('Gemini WebSocket error:', err);
   });
 
-  // 5. HANDLE AUDIO COMING FROM TWILIO -> GEMINI
+  // AUDIO INPUT (Twilio -> Gemini)
   twilioWs.on('message', (message) => {
-    const msg = JSON.parse(message);
-    
+    let msg;
+    try {
+      msg = JSON.parse(message);
+    } catch (err) {
+      return;
+    }
+
     switch (msg.event) {
       case 'start':
         streamSid = msg.start.streamSid;
-        console.log(`Stream started: ${streamSid}`);
+        console.log(`Stream active: ${streamSid}`);
         break;
-        
+
       case 'media':
-        // THE FIX: Do not send audio until Gemini says setupComplete
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
           try {
-            const twilioAudioBase64 = msg.media.payload;
+            // Transcode Twilio's 8kHz 8-bit mu-law up to Gemini's 16kHz 16-bit PCM
             const wav = new WaveFile();
-            
-            wav.fromScratch(1, 8000, '8m', Buffer.from(twilioAudioBase64, 'base64'));
+            wav.fromScratch(1, 8000, '8m', Buffer.from(msg.media.payload, 'base64'));
             wav.fromMuLaw();
             wav.toSampleRate(16000);
-            
+
             const pcmData = new Int16Array(wav.data.samples);
             const geminiPayload = Buffer.from(pcmData.buffer).toString('base64');
 
             geminiWs.send(JSON.stringify({
               realtimeInput: {
                 mediaChunks: [{
-                  mimeType: "audio/pcm;rate=16000",
+                  mimeType: 'audio/pcm;rate=16000',
                   data: geminiPayload
                 }]
               }
             }));
           } catch (err) {
-             console.error("Transcoding error (Twilio -> Gemini):", err);
+            console.error('Twilio -> Gemini audio transcoding error:', err);
           }
         }
         break;
-        
+
       case 'stop':
-        console.log(`Twilio stream ${streamSid} ended.`);
-        geminiWs.close();
+        console.log(`Call ended: ${streamSid}`);
+        if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
         break;
     }
   });
 
   twilioWs.on('close', () => {
-    console.log('Twilio disconnected.');
-    geminiWs.close();
+    if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
   });
-  
+
   geminiWs.on('close', (code, reason) => {
-     console.log(`Gemini disconnected. Code: ${code}, Reason: ${reason}`);
+    console.log(`Gemini session closed. Code: ${code}, Reason: ${reason}`);
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Live Multimodal Server online on port ${PORT}`);
+  console.log(`Voice server active on port ${PORT}`);
 });
