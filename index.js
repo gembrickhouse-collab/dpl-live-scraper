@@ -11,17 +11,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 // --- AUDIO TRANSCODING TABLES & FUNCTIONS ---
-// 1. Twilio -> Gemini (8kHz mu-law to 16-bit PCM)
 const muLawToPcm = new Int16Array(256);
 for (let i = 0; i < 256; i++) {
-  let mu = ~i;
+  let mu = ~i & 0xFF;
   let sign = (mu & 0x80) ? -1 : 1;
   let exponent = (mu & 0x70) >> 4;
   let data = mu & 0x0F;
-  muLawToPcm[i] = sign * ((data << 3) + 132 << exponent) - 132;
+  let magnitude = (((data << 3) + 132) << exponent) - 132;
+  muLawToPcm[i] = sign * magnitude;
 }
 
-// 2. Gemini -> Twilio (16-bit PCM to 8kHz mu-law)
 function pcmToMuLaw(pcm) {
   const MAX = 32635;
   if (pcm > MAX) pcm = MAX;
@@ -85,6 +84,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   let streamSid = null;
   let isGeminiReady = false;
+  let audioBuffer = []; // 100ms Chunk Buffer
 
   let pastMemoriesArray = [];
   try {
@@ -103,7 +103,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     const setupMessage = {
       setup: {
-        model: 'models/gemini-3.8-live', 
+        model: 'models/gemini-2.0-flash', 
         systemInstruction: {
           parts: [{
             text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
@@ -152,8 +152,19 @@ wss.on('connection', async (twilioWs, req) => {
     try { response = JSON.parse(data); } catch (err) { return; }
 
     if (response.setupComplete) {
-      console.log('Gemini Live session ready for audio exchange.');
+      console.log('Gemini Live session ready. Forcing initial greeting.');
       isGeminiReady = true;
+      
+      // Inject text to break the passive state and force audio generation
+      geminiWs.send(JSON.stringify({
+        clientContent: {
+          turns: [{
+            role: 'user',
+            parts: [{ text: 'System connection successful. Please briefly introduce yourself and let me know you are listening.' }]
+          }],
+          turnComplete: true
+        }
+      }));
       return;
     }
 
@@ -201,7 +212,6 @@ wss.on('connection', async (twilioWs, req) => {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
           
-          // Downsample 24kHz to 8kHz by taking every 3rd sample (every 6th byte)
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
           for (let i = 0; i < geminiBytes.length; i += 6) {
@@ -239,18 +249,25 @@ wss.on('connection', async (twilioWs, req) => {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
 
-          // Upsample 8kHz to 16kHz by writing each sample twice
           for (let i = 0; i < twilioBytes.length; i++) {
             const pcm16 = muLawToPcm[twilioBytes[i]];
-            pcmBuffer.writeInt16LE(pcm16, i * 4);      // Sample 1
-            pcmBuffer.writeInt16LE(pcm16, i * 4 + 2);  // Sample 2
+            pcmBuffer.writeInt16LE(pcm16, i * 4);      
+            pcmBuffer.writeInt16LE(pcm16, i * 4 + 2);  
           }
 
-          geminiWs.send(JSON.stringify({
-            realtimeInput: {
-              mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: pcmBuffer.toString('base64') }]
-            }
-          }));
+          audioBuffer.push(pcmBuffer);
+          
+          // Buffer 5 chunks (~100ms) before sending to Gemini VAD
+          if (audioBuffer.length >= 5) {
+            const combinedBuffer = Buffer.concat(audioBuffer);
+            audioBuffer = []; 
+            
+            geminiWs.send(JSON.stringify({
+              realtimeInput: {
+                mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: combinedBuffer.toString('base64') }]
+              }
+            }));
+          }
         }
         break;
         
