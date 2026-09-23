@@ -1,7 +1,8 @@
 FROM node:20
 
-# Install dependencies required by Puppeteer's headless Chrome
+# Install the official Chromium package and its dependencies
 RUN apt-get update && apt-get install -y \
+    chromium \
     wget \
     gnupg \
     ca-certificates \
@@ -16,9 +17,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
-
-# NEW: Force Puppeteer to download Chrome into the permanent app directory
-ENV PUPPETEER_CACHE_DIR=/usr/src/app/.cache
 
 COPY package*.json ./
 RUN npm install
