@@ -21,35 +21,29 @@ async function scrapeDPL(query) {
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
     
-    // STEP 1: Visit the homepage first to establish a secure session cookie
     console.log("Establishing session with library server...");
     await page.goto('https://catalog.denverlibrary.org/', { waitUntil: 'domcontentloaded', timeout: 20000 });
     
-    // STEP 2: Navigate to the actual search results
     console.log(`Searching for: ${cleanQuery}`);
     const searchUrl = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
     
-    const results = await page.evaluate(() => {
-      let titles = [];
-      // Target the exact anchor link IDs that Polaris uses for book titles, ignoring the sidebar
-      const elements = document.querySelectorAll('a[id*="lnkTitle"]');
-      for (let el of elements) {
-        const text = el.innerText.trim().replace(/\s+/g, ' ');
-        if (text && !titles.includes(text) && titles.length < 3) {
-          titles.push(text);
-        }
-      }
-      return titles;
+    // THE ULTIMATE INSPECTOR: Grab every link's text, ID, and Class
+    const linkMap = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('a'))
+        .filter(a => a.innerText.trim().length > 0)
+        .map(a => `[TEXT: ${a.innerText.trim().replace(/\n/g, ' ').substring(0, 40)}] [ID: ${a.id}] [CLASS: ${a.className}]`)
+        .join('\n');
     });
+
+    console.log(`\n--- DOM LINK MAP FOR "${cleanQuery}" ---`);
+    console.log(linkMap.substring(0, 4000)); 
+    console.log(`--------------------------------------\n`);
 
     await browser.close();
 
-    if (results.length === 0) {
-      return `No results found for "${cleanQuery}" at the Denver Public Library.`;
-    }
-
-    return `DPL Results for "${cleanQuery}":\n\n1. ${results[0] || ''}\n2. ${results[1] || ''}\n3. ${results[2] || ''}`;
+    // Send a temporary diagnostic text to your phone
+    return `Diagnostic run complete for "${cleanQuery}". Check the Render logs!`;
   } catch (error) {
     if (browser) await browser.close();
     console.error("Scraper error:", error.message);
@@ -69,7 +63,7 @@ app.post('/sms', async (req, res) => {
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       to: userPhoneNumber
     });
-    console.log("Library results sent successfully!");
+    console.log("Diagnostic message sent successfully!");
   } catch (error) {
     console.error("Failed to send message via Twilio:", error);
   }
