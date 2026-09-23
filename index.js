@@ -3,7 +3,6 @@ const http = require('http');
 const WebSocket = require('ws');
 const twilio = require('twilio');
 const { WaveFile } = require('wavefile');
-const { Redis } = require('@upstash/redis');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,13 +11,30 @@ const wss = new WebSocket.Server({ server, path: '/stream' });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Connect to Upstash Redis database
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+// Helper function to talk directly to Upstash without any extra npm packages
+async function redisCommand(command, ...args) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
 
-// 1. INITIAL CALL HANDLER (Twilio hits this first)
+  try {
+    const res = await fetch(`${url}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify([command, ...args]),
+    });
+    const data = await res.json();
+    return data.result;
+  } catch (err) {
+    console.error(`Upstash error on ${command}:`, err);
+    return null;
+  }
+}
+
+// 1. INITIAL CALL HANDLER
 app.post('/voice', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callerId = req.body.From || 'Unknown';
@@ -44,10 +60,11 @@ wss.on('connection', async (twilioWs, req) => {
   let streamSid = null;
   let isGeminiReady = false;
 
-  // Retrieve existing caller memories from Redis
+  // Retrieve existing caller memories from Upstash via fetch
   let pastMemoriesArray = [];
   try {
-    pastMemoriesArray = await redis.lrange(callerId, 0, -1);
+    const result = await redisCommand('LRANGE', callerId, '0', '-1');
+    if (Array.isArray(result)) pastMemoriesArray = result;
   } catch (err) {
     console.error('Redis memory retrieval error:', err);
   }
@@ -55,7 +72,7 @@ wss.on('connection', async (twilioWs, req) => {
     ? pastMemoriesArray.join('. ')
     : 'No previous conversations recorded.';
 
-  // Connect to the Gemini Live multimodal WebSocket
+  // Connect to Gemini Live WebSocket
   const geminiUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GEMINI_API_KEY}`;
   const geminiWs = new WebSocket(geminiUrl);
 
@@ -67,7 +84,7 @@ wss.on('connection', async (twilioWs, req) => {
         model: 'models/gemini-2.0-flash-exp',
         systemInstruction: {
           parts: [{
-            text: `You are a helpful, fast voice assistant conversing over a live telephone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, preferences, or details to keep, invoke the save_memory tool. If they ask about current weather or temperatures, invoke the get_weather tool.`
+            text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
           }]
         },
         tools: [{
@@ -85,7 +102,7 @@ wss.on('connection', async (twilioWs, req) => {
             },
             {
               name: 'get_weather',
-              description: 'Fetch current weather and temperature for a given city or location.',
+              description: 'Fetch current weather and temperature for a given location.',
               parameters: {
                 type: 'object',
                 properties: {
@@ -133,7 +150,7 @@ wss.on('connection', async (twilioWs, req) => {
         if (call.name === 'save_memory') {
           const fact = call.args.fact;
           try {
-            await redis.rpush(callerId, fact);
+            await redisCommand('RPUSH', callerId, fact);
             console.log(`Stored fact for ${callerId}: ${fact}`);
             functionResponses.push({
               id: call.id,
@@ -152,7 +169,6 @@ wss.on('connection', async (twilioWs, req) => {
           const location = call.args.location;
           let forecast = `Weather information for ${location} is currently unavailable.`;
           try {
-            // Free weather endpoint requiring no API key
             const res = await fetch(`https://wttr.in/${encodeURIComponent(location)}?format=%C,+%t+(Feels+like+%f),+Wind:+%w`);
             if (res.ok) {
               const text = await res.text();
@@ -181,7 +197,6 @@ wss.on('connection', async (twilioWs, req) => {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           try {
-            // Transcode 24kHz 16-bit PCM down to Twilio's 8kHz 8-bit mu-law
             const wav = new WaveFile();
             wav.fromScratch(1, 24000, '16', Buffer.from(part.inlineData.data, 'base64'));
             wav.toSampleRate(8000);
@@ -226,7 +241,6 @@ wss.on('connection', async (twilioWs, req) => {
       case 'media':
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
           try {
-            // Transcode Twilio's 8kHz 8-bit mu-law up to Gemini's 16kHz 16-bit PCM
             const wav = new WaveFile();
             wav.fromScratch(1, 8000, '8m', Buffer.from(msg.media.payload, 'base64'));
             wav.fromMuLaw();
