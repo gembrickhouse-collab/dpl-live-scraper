@@ -28,22 +28,26 @@ async function scrapeDPL(query) {
     const searchUrl = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
     
-    // THE ULTIMATE INSPECTOR: Grab every link's text, ID, and Class
-    const linkMap = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll('a'))
-        .filter(a => a.innerText.trim().length > 0)
-        .map(a => `[TEXT: ${a.innerText.trim().replace(/\n/g, ' ').substring(0, 40)}] [ID: ${a.id}] [CLASS: ${a.className}]`)
-        .join('\n');
+    const results = await page.evaluate(() => {
+      let titles = [];
+      // TARGET ACQUIRED: Using the exact class revealed in our Render logs
+      const elements = document.querySelectorAll('.nsm-brief-action-link');
+      for (let el of elements) {
+        const text = el.innerText.trim().replace(/\s+/g, ' ');
+        if (text && !titles.includes(text) && titles.length < 3) {
+          titles.push(text);
+        }
+      }
+      return titles;
     });
-
-    console.log(`\n--- DOM LINK MAP FOR "${cleanQuery}" ---`);
-    console.log(linkMap.substring(0, 4000)); 
-    console.log(`--------------------------------------\n`);
 
     await browser.close();
 
-    // Send a temporary diagnostic text to your phone
-    return `Diagnostic run complete for "${cleanQuery}". Check the Render logs!`;
+    if (results.length === 0) {
+      return `No results found for "${cleanQuery}" at the Denver Public Library.`;
+    }
+
+    return `DPL Results for "${cleanQuery}":\n\n1. ${results[0] || ''}\n2. ${results[1] || ''}\n3. ${results[2] || ''}`;
   } catch (error) {
     if (browser) await browser.close();
     console.error("Scraper error:", error.message);
@@ -63,7 +67,7 @@ app.post('/sms', async (req, res) => {
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       to: userPhoneNumber
     });
-    console.log("Diagnostic message sent successfully!");
+    console.log("Library results sent successfully!");
   } catch (error) {
     console.error("Failed to send message via Twilio:", error);
   }
