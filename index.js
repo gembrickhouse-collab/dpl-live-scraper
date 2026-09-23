@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const twilio = require('twilio');
-const { WaveFile } = require('wavefile');
 
 const app = express();
 const server = http.createServer(app);
@@ -11,7 +10,34 @@ const wss = new WebSocket.Server({ server, path: '/stream' });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Helper function to talk directly to Upstash without extra npm packages
+// --- AUDIO TRANSCODING TABLES & FUNCTIONS ---
+// 1. Twilio -> Gemini (8kHz mu-law to 16-bit PCM)
+const muLawToPcm = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  let mu = ~i;
+  let sign = (mu & 0x80) ? -1 : 1;
+  let exponent = (mu & 0x70) >> 4;
+  let data = mu & 0x0F;
+  muLawToPcm[i] = sign * ((data << 3) + 132 << exponent) - 132;
+}
+
+// 2. Gemini -> Twilio (16-bit PCM to 8kHz mu-law)
+function pcmToMuLaw(pcm) {
+  const MAX = 32635;
+  if (pcm > MAX) pcm = MAX;
+  if (pcm < -MAX) pcm = -MAX;
+  let sign = (pcm < 0) ? 0x80 : 0x00;
+  if (pcm < 0) pcm = -pcm;
+  pcm += 132;
+  if (pcm > 32767) pcm = 32767;
+  let exponent = 7;
+  for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  let mantissa = (pcm >> (exponent === 0 ? 1 : exponent + 3)) & 0x0F;
+  let mu = ~(sign | (exponent << 4) | mantissa);
+  return mu & 0xFF;
+}
+
+// --- UPSTASH REDIS HELPER ---
 async function redisCommand(command, ...args) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -60,19 +86,15 @@ wss.on('connection', async (twilioWs, req) => {
   let streamSid = null;
   let isGeminiReady = false;
 
-  // Retrieve existing caller memories from Upstash via fetch
   let pastMemoriesArray = [];
   try {
     const result = await redisCommand('LRANGE', callerId, '0', '-1');
     if (Array.isArray(result)) pastMemoriesArray = result;
-  } catch (err) {
-    console.error('Redis memory retrieval error:', err);
-  }
+  } catch (err) {}
   const pastMemories = pastMemoriesArray.length > 0
     ? pastMemoriesArray.join('. ')
     : 'No previous conversations recorded.';
 
-  // Connect to Gemini Live WebSocket
   const geminiUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GEMINI_API_KEY}`;
   const geminiWs = new WebSocket(geminiUrl);
 
@@ -121,18 +143,13 @@ wss.on('connection', async (twilioWs, req) => {
         }
       }
     };
-
     geminiWs.send(JSON.stringify(setupMessage));
   });
 
   // Handle messages received from Gemini
   geminiWs.on('message', async (data) => {
     let response;
-    try {
-      response = JSON.parse(data);
-    } catch (err) {
-      return;
-    }
+    try { response = JSON.parse(data); } catch (err) { return; }
 
     if (response.setupComplete) {
       console.log('Gemini Live session ready for audio exchange.');
@@ -182,26 +199,23 @@ wss.on('connection', async (twilioWs, req) => {
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
-          try {
-            const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-            // THE FIX: Explicitly cast the raw bytes into a 16-bit array
-            const geminiSamples = new Int16Array(geminiBytes.buffer, geminiBytes.byteOffset, geminiBytes.byteLength / 2);
-            
-            const wav = new WaveFile();
-            wav.fromScratch(1, 24000, '16', geminiSamples);
-            wav.toSampleRate(8000);
-            wav.toMuLaw();
+          const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
+          
+          // Downsample 24kHz to 8kHz by taking every 3rd sample (every 6th byte)
+          const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
+          let outIdx = 0;
+          for (let i = 0; i < geminiBytes.length; i += 6) {
+            if (outIdx >= muLawBuffer.length) break;
+            const pcm16 = geminiBytes.readInt16LE(i);
+            muLawBuffer[outIdx++] = pcmToMuLaw(pcm16);
+          }
 
-            const twilioPayload = Buffer.from(wav.data.samples).toString('base64');
-            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-              twilioWs.send(JSON.stringify({
-                event: 'media',
-                streamSid: streamSid,
-                media: { payload: twilioPayload }
-              }));
-            }
-          } catch (err) {
-            console.error('Gemini -> Twilio Transcoding Error:', err);
+          if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid: streamSid,
+              media: { payload: muLawBuffer.toString('base64') }
+            }));
           }
         }
       }
@@ -222,23 +236,21 @@ wss.on('connection', async (twilioWs, req) => {
 
       case 'media':
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
-          try {
-            const twilioBytes = Buffer.from(msg.media.payload, 'base64');
-            const wav = new WaveFile();
-            wav.fromScratch(1, 8000, '8m', twilioBytes);
-            wav.fromMuLaw();
-            wav.toSampleRate(16000);
-            wav.toBitDepth('16'); // THE FIX: Force conversion to 16-bit depth
+          const twilioBytes = Buffer.from(msg.media.payload, 'base64');
+          const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
 
-            const pcmData = new Int16Array(wav.data.samples);
-            const geminiPayload = Buffer.from(pcmData.buffer).toString('base64');
+          // Upsample 8kHz to 16kHz by writing each sample twice
+          for (let i = 0; i < twilioBytes.length; i++) {
+            const pcm16 = muLawToPcm[twilioBytes[i]];
+            pcmBuffer.writeInt16LE(pcm16, i * 4);      // Sample 1
+            pcmBuffer.writeInt16LE(pcm16, i * 4 + 2);  // Sample 2
+          }
 
-            geminiWs.send(JSON.stringify({
-              realtimeInput: {
-                mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: geminiPayload }]
-              }
-            }));
-          } catch (err) {}
+          geminiWs.send(JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: pcmBuffer.toString('base64') }]
+            }
+          }));
         }
         break;
         
