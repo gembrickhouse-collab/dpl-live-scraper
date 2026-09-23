@@ -14,8 +14,9 @@ async function scrapeDPL(query) {
   
   let browser;
   try {
-    // Launch headless browser with flags required for Docker
+    // Launch headless browser using the system-installed Chromium
     browser = await puppeteer.launch({
+      executablePath: '/usr/bin/chromium',
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
@@ -23,7 +24,6 @@ async function scrapeDPL(query) {
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
     
-    // Wait until JavaScript finishes loading the books
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
     
     const results = await page.evaluate(() => {
