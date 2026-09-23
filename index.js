@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const twilio = require('twilio');
+const { WaveFile } = require('wavefile');
 
 const app = express();
 const server = http.createServer(app);
@@ -9,32 +10,6 @@ const wss = new WebSocket.Server({ server, path: '/stream' });
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-
-// --- AUDIO TRANSCODING TABLES & FUNCTIONS ---
-const muLawToPcm = new Int16Array(256);
-for (let i = 0; i < 256; i++) {
-  let mu = ~i & 0xFF;
-  let sign = (mu & 0x80) ? -1 : 1;
-  let exponent = (mu & 0x70) >> 4;
-  let data = mu & 0x0F;
-  let magnitude = (((data << 3) + 132) << exponent) - 132;
-  muLawToPcm[i] = sign * magnitude;
-}
-
-function pcmToMuLaw(pcm) {
-  const MAX = 32635;
-  if (pcm > MAX) pcm = MAX;
-  if (pcm < -MAX) pcm = -MAX;
-  let sign = (pcm < 0) ? 0x80 : 0x00;
-  if (pcm < 0) pcm = -pcm;
-  pcm += 132;
-  if (pcm > 32767) pcm = 32767;
-  let exponent = 7;
-  for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-  let mantissa = (pcm >> (exponent === 0 ? 1 : exponent + 3)) & 0x0F;
-  let mu = ~(sign | (exponent << 4) | mantissa);
-  return mu & 0xFF;
-}
 
 // --- UPSTASH REDIS HELPER ---
 async function redisCommand(command, ...args) {
@@ -66,8 +41,6 @@ app.post('/voice', (req, res) => {
   twiml.say({ voice: 'Polly.Joanna' }, "Connecting to Gemini Live.");
 
   const connect = twiml.connect();
-  // REVERTED: Bidirectional streams natively support both directions, 
-  // but explicitly requesting 'both_tracks' causes a fatal TwiML crash.
   connect.stream({
     url: `wss://${req.get('host')}/stream?caller=${encodeURIComponent(callerId)}`
   });
@@ -206,21 +179,26 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
+    // --- AUDIO OUTPUT (Gemini -> Twilio) ---
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
-          const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-          console.log(`[Gemini] Transcoding ${geminiBytes.length} bytes of raw audio.`);
-          
-          const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
-          let outIdx = 0;
-          for (let i = 0; i < geminiBytes.length; i += 6) {
-            if (outIdx >= muLawBuffer.length) break;
-            const pcm16 = geminiBytes.readInt16LE(i);
-            muLawBuffer[outIdx++] = pcmToMuLaw(pcm16);
+          try {
+            const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
+            console.log(`[Gemini] Transcoding ${geminiBytes.length} bytes of raw audio.`);
+            
+            // Mathematically perfect transcoding via wavefile
+            const pcm16 = new Int16Array(geminiBytes.buffer, geminiBytes.byteOffset, geminiBytes.byteLength / 2);
+            const wav = new WaveFile();
+            wav.fromScratch(1, 24000, '16', pcm16);
+            wav.toSampleRate(8000);
+            wav.toMuLaw();
+            
+            const muLawBuffer = Buffer.from(wav.data.samples);
+            twilioOutboundBuffer = Buffer.concat([twilioOutboundBuffer, muLawBuffer]);
+          } catch (err) {
+            console.error('Wavefile Outbound Transcode Error:', err);
           }
-
-          twilioOutboundBuffer = Buffer.concat([twilioOutboundBuffer, muLawBuffer]);
         }
       }
     }
@@ -228,6 +206,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   geminiWs.on('error', (err) => console.error('Gemini error:', err));
 
+  // --- AUDIO INPUT (Twilio -> Gemini) ---
   twilioWs.on('message', (message) => {
     let msg;
     try { msg = JSON.parse(message); } catch (err) { return; }
@@ -239,34 +218,37 @@ wss.on('connection', async (twilioWs, req) => {
 
       case 'media':
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
-          const twilioBytes = Buffer.from(msg.media.payload, 'base64');
-          const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
-
-          for (let i = 0; i < twilioBytes.length; i++) {
-            const pcm16 = muLawToPcm[twilioBytes[i]];
-            pcmBuffer.writeInt16LE(pcm16, i * 4);      
-            pcmBuffer.writeInt16LE(pcm16, i * 4 + 2);  
-          }
-
-          audioBuffer.push(pcmBuffer);
-          
-          if (audioBuffer.length >= 5) {
-            const combinedBuffer = Buffer.concat(audioBuffer);
-            audioBuffer = []; 
+          try {
+            const twilioBytes = Buffer.from(msg.media.payload, 'base64');
             
-            geminiWs.send(JSON.stringify({
-              realtimeInput: {
-                mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: combinedBuffer.toString('base64') }]
-              }
-            }));
-          }
+            const wav = new WaveFile();
+            wav.fromScratch(1, 8000, '8m', twilioBytes);
+            wav.fromMuLaw();
+            wav.toSampleRate(16000);
+            wav.toBitDepth('16');
+            
+            const pcm16 = new Int16Array(wav.data.samples);
+            const pcmBuffer = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+
+            audioBuffer.push(pcmBuffer);
+            
+            if (audioBuffer.length >= 5) {
+              const combinedBuffer = Buffer.concat(audioBuffer);
+              audioBuffer = []; 
+              
+              geminiWs.send(JSON.stringify({
+                realtimeInput: {
+                  mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: combinedBuffer.toString('base64') }]
+                }
+              }));
+            }
+          } catch (err) {}
         }
         
-        // Push up to 40ms of audio per Twilio tick to smoothly catch up to Gemini
-        if (streamSid && twilioOutboundBuffer.length > 0) {
-          const chunkSize = Math.min(twilioOutboundBuffer.length, 320); 
-          const frame = twilioOutboundBuffer.subarray(0, chunkSize);
-          twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(chunkSize));
+        // PERFECT PACING: Drain exactly 160 bytes (20ms) per Twilio tick to match real-time playback
+        if (streamSid && twilioOutboundBuffer.length >= 160) {
+          const frame = twilioOutboundBuffer.subarray(0, 160);
+          twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
           
           twilioWs.send(JSON.stringify({
             event: 'media',
