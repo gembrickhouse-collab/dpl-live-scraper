@@ -85,7 +85,7 @@ wss.on('connection', async (twilioWs, req) => {
   let isGeminiReady = false;
   let audioBuffer = []; 
   let twilioOutboundBuffer = Buffer.alloc(0); 
-  let isBufferPrimed = false; // THE FIX: Tracks if Twilio has a safe cushion
+  let isBufferPrimed = false;
 
   let pastMemoriesArray = [];
   try {
@@ -104,7 +104,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     const setupMessage = {
       setup: {
-        model: 'models/gemini-2.0-flash-exp-0827', 
+        model: 'models/gemini-3.8-live', 
         systemInstruction: {
           parts: [{
             text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
@@ -170,7 +170,7 @@ wss.on('connection', async (twilioWs, req) => {
     if (response.serverContent?.interrupted) {
       console.log('Gemini detected user interruption. Clearing audio buffer.');
       twilioOutboundBuffer = Buffer.alloc(0);
-      isBufferPrimed = false; // Reset the cushion
+      isBufferPrimed = false;
       return;
     }
 
@@ -205,12 +205,12 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
-    // --- AUDIO OUTPUT (Gemini -> Twilio) ---
+    // --- AUDIO OUTPUT (Gemini -> Twilio Holding Tank) ---
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-          console.log(`[Gemini] Transcoding ${geminiBytes.length} bytes of raw audio.`);
+          console.log(`[Gemini] Transcoding and dropping ${geminiBytes.length} bytes into holding tank.`);
           
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
@@ -227,8 +227,12 @@ wss.on('connection', async (twilioWs, req) => {
   });
 
   geminiWs.on('error', (err) => console.error('Gemini error:', err));
+  
+  geminiWs.on('close', (code, reason) => {
+    console.log(`Gemini session closed. Code: ${code}, Reason: ${reason}`);
+  });
 
-  // --- AUDIO INPUT (Twilio -> Gemini) ---
+  // --- AUDIO INPUT & PACING CLOCK (Twilio -> Gemini -> Twilio) ---
   twilioWs.on('message', (message) => {
     let msg;
     try { msg = JSON.parse(message); } catch (err) { return; }
@@ -239,6 +243,7 @@ wss.on('connection', async (twilioWs, req) => {
         break;
 
       case 'media':
+        // 1. Send incoming audio up to Gemini
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
@@ -262,11 +267,10 @@ wss.on('connection', async (twilioWs, req) => {
             }));
           }
         }
-        
-        // --- THE FIX: JITTER BUFFER PRIMING ---
+
+        // 2. Safely drain the holding tank back to Twilio
         if (streamSid && twilioOutboundBuffer.length >= 160) {
           if (!isBufferPrimed) {
-             // Inject a rapid burst of 5 frames (100ms) to safely fill Twilio's jitter buffer
              const primeFrames = Math.min(5, Math.floor(twilioOutboundBuffer.length / 160));
              for (let i = 0; i < primeFrames; i++) {
                 const frame = twilioOutboundBuffer.subarray(0, 160);
@@ -279,7 +283,6 @@ wss.on('connection', async (twilioWs, req) => {
              }
              isBufferPrimed = true;
           } else {
-             // Coast smoothly at exactly 1 frame per 20ms tick
              const frame = twilioOutboundBuffer.subarray(0, 160);
              twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
              twilioWs.send(JSON.stringify({
