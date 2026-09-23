@@ -14,7 +14,6 @@ async function scrapeDPL(query) {
   
   let browser;
   try {
-    // Launch headless browser using the system-installed Chromium
     browser = await puppeteer.launch({
       executablePath: '/usr/bin/chromium',
       headless: true,
@@ -26,6 +25,12 @@ async function scrapeDPL(query) {
     
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
     
+    // NEW: Extract all visible text on the page to see what the browser is actually looking at
+    const pageText = await page.evaluate(() => document.body.innerText);
+    console.log(`--- VISIBLE PAGE TEXT FOR "${cleanQuery}" ---`);
+    console.log(pageText.substring(0, 1500)); 
+    console.log(`-------------------------------------------`);
+
     const results = await page.evaluate(() => {
       let titles = [];
       const elements = document.querySelectorAll('.ns-title, a[id*="Title"], a[id*="title"]');
