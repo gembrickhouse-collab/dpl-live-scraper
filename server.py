@@ -1,9 +1,11 @@
 import os
 import uvicorn
 from fastapi import FastAPI, WebSocket
-from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketTransport
+
+# THE FIX: Updated to the new Pipecat 1.11.0 import paths
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.services.google import GeminiLiveLLMService
+from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.pipeline.runner import PipelineRunner
@@ -28,20 +30,21 @@ async def websocket_endpoint(websocket: WebSocket):
     
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
-        params=FastAPIWebsocketTransport.Params(
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
             audio_out_enabled=True,
+            add_wav_header=False,
             vad_enabled=True,
-        ),
-        serializer=serializer
+            vad_audio_passthrough=True,
+            serializer=serializer
+        )
     )
 
     # 3. Native connection to Gemini 3.8 Live API
     llm = GeminiLiveLLMService(
         api_key=os.getenv("GEMINI_API_KEY"),
-        settings=GeminiLiveLLMService.Settings(
-            model="gemini-3.8-live",
-            system_instruction="You are a helpful voice assistant.",
-        ),
+        model="gemini-3.8-live",
+        system_instruction="You are a helpful voice assistant conversing over a phone call. Keep responses natural, brief, and conversational.",
         tools=[get_weather, save_memory]
     )
 
@@ -56,6 +59,7 @@ async def websocket_endpoint(websocket: WebSocket):
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
+            audio_in_sample_rate=8000,
             audio_out_sample_rate=8000, 
             allow_interruptions=True
         )
@@ -65,5 +69,4 @@ async def websocket_endpoint(websocket: WebSocket):
     await runner.run(task)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT",
-                                                        3000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 3000)))
