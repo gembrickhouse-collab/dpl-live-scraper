@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const twilio = require('twilio');
-const { WaveFile } = require('wavefile');
 
 const app = express();
 const server = http.createServer(app);
@@ -10,6 +9,32 @@ const wss = new WebSocket.Server({ server, path: '/stream' });
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// --- AUDIO TRANSCODING TABLES & FUNCTIONS ---
+const muLawToPcm = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  let mu = ~i & 0xFF;
+  let sign = (mu & 0x80) ? -1 : 1;
+  let exponent = (mu & 0x70) >> 4;
+  let data = mu & 0x0F;
+  let magnitude = (((data << 3) + 132) << exponent) - 132;
+  muLawToPcm[i] = sign * magnitude;
+}
+
+function pcmToMuLaw(pcm) {
+  const MAX = 32635;
+  if (pcm > MAX) pcm = MAX;
+  if (pcm < -MAX) pcm = -MAX;
+  let sign = (pcm < 0) ? 0x80 : 0x00;
+  if (pcm < 0) pcm = -pcm;
+  pcm += 132;
+  if (pcm > 32767) pcm = 32767;
+  let exponent = 7;
+  for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  let mantissa = (pcm >> (exponent === 0 ? 1 : exponent + 3)) & 0x0F;
+  let mu = ~(sign | (exponent << 4) | mantissa);
+  return mu & 0xFF;
+}
 
 // --- UPSTASH REDIS HELPER ---
 async function redisCommand(command, ...args) {
@@ -59,7 +84,6 @@ wss.on('connection', async (twilioWs, req) => {
   let streamSid = null;
   let isGeminiReady = false;
   let audioBuffer = []; 
-  let twilioOutboundBuffer = Buffer.alloc(0); 
 
   let pastMemoriesArray = [];
   try {
@@ -78,7 +102,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     const setupMessage = {
       setup: {
-        model: 'models/gemini-3.8-live', 
+        model: 'models/gemini-2.0-flash-exp-0827', 
         systemInstruction: {
           parts: [{
             text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
@@ -141,12 +165,6 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
-    if (response.serverContent?.interrupted) {
-      console.log('Gemini detected user interruption. Clearing audio buffer.');
-      twilioOutboundBuffer = Buffer.alloc(0);
-      return;
-    }
-
     if (response.toolCall) {
       const calls = response.toolCall.functionCalls || [];
       const functionResponses = [];
@@ -162,7 +180,6 @@ wss.on('connection', async (twilioWs, req) => {
           }
         } else if (call.name === 'get_weather') {
           const location = call.args.location;
-          console.log(`Gemini requested weather for: ${location}`); 
           let forecast = `Weather information for ${location} is unavailable.`;
           try {
             const res = await fetch(`https://wttr.in/${encodeURIComponent(location)}?format=%C,+%t+(Feels+like+%f),+Wind:+%w`);
@@ -183,21 +200,24 @@ wss.on('connection', async (twilioWs, req) => {
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
-          try {
-            const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-            console.log(`[Gemini] Transcoding ${geminiBytes.length} bytes of raw audio.`);
-            
-            // Mathematically perfect transcoding via wavefile
-            const pcm16 = new Int16Array(geminiBytes.buffer, geminiBytes.byteOffset, geminiBytes.byteLength / 2);
-            const wav = new WaveFile();
-            wav.fromScratch(1, 24000, '16', pcm16);
-            wav.toSampleRate(8000);
-            wav.toMuLaw();
-            
-            const muLawBuffer = Buffer.from(wav.data.samples);
-            twilioOutboundBuffer = Buffer.concat([twilioOutboundBuffer, muLawBuffer]);
-          } catch (err) {
-            console.error('Wavefile Outbound Transcode Error:', err);
+          const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
+          console.log(`[Gemini] Transcoding and forwarding ${geminiBytes.length} bytes of raw audio.`);
+          
+          // Downsample 24kHz -> 8kHz manually, avoiding library overhead
+          const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
+          let outIdx = 0;
+          for (let i = 0; i < geminiBytes.length; i += 6) {
+            if (outIdx >= muLawBuffer.length) break;
+            const pcm16 = geminiBytes.readInt16LE(i);
+            muLawBuffer[outIdx++] = pcmToMuLaw(pcm16);
+          }
+
+          if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid: streamSid,
+              media: { payload: muLawBuffer.toString('base64') }
+            }));
           }
         }
       }
@@ -218,43 +238,27 @@ wss.on('connection', async (twilioWs, req) => {
 
       case 'media':
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
-          try {
-            const twilioBytes = Buffer.from(msg.media.payload, 'base64');
-            
-            const wav = new WaveFile();
-            wav.fromScratch(1, 8000, '8m', twilioBytes);
-            wav.fromMuLaw();
-            wav.toSampleRate(16000);
-            wav.toBitDepth('16');
-            
-            const pcm16 = new Int16Array(wav.data.samples);
-            const pcmBuffer = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+          const twilioBytes = Buffer.from(msg.media.payload, 'base64');
+          const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
 
-            audioBuffer.push(pcmBuffer);
-            
-            if (audioBuffer.length >= 5) {
-              const combinedBuffer = Buffer.concat(audioBuffer);
-              audioBuffer = []; 
-              
-              geminiWs.send(JSON.stringify({
-                realtimeInput: {
-                  mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: combinedBuffer.toString('base64') }]
-                }
-              }));
-            }
-          } catch (err) {}
-        }
-        
-        // PERFECT PACING: Drain exactly 160 bytes (20ms) per Twilio tick to match real-time playback
-        if (streamSid && twilioOutboundBuffer.length >= 160) {
-          const frame = twilioOutboundBuffer.subarray(0, 160);
-          twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
+          for (let i = 0; i < twilioBytes.length; i++) {
+            const pcm16 = muLawToPcm[twilioBytes[i]];
+            pcmBuffer.writeInt16LE(pcm16, i * 4);      
+            pcmBuffer.writeInt16LE(pcm16, i * 4 + 2);  
+          }
+
+          audioBuffer.push(pcmBuffer);
           
-          twilioWs.send(JSON.stringify({
-            event: 'media',
-            streamSid: streamSid,
-            media: { payload: frame.toString('base64') }
-          }));
+          if (audioBuffer.length >= 5) {
+            const combinedBuffer = Buffer.concat(audioBuffer);
+            audioBuffer = []; 
+            
+            geminiWs.send(JSON.stringify({
+              realtimeInput: {
+                mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: combinedBuffer.toString('base64') }]
+              }
+            }));
+          }
         }
         break;
         
