@@ -54,7 +54,6 @@ async function redisCommand(command, ...args) {
     const data = await res.json();
     return data.result;
   } catch (err) {
-    console.error(`Upstash error on ${command}:`, err);
     return null;
   }
 }
@@ -85,7 +84,22 @@ wss.on('connection', async (twilioWs, req) => {
   let streamSid = null;
   let isGeminiReady = false;
   let audioBuffer = []; 
-  let twilioOutboundBuffer = Buffer.alloc(0); // THE NEW OUTBOUND BUFFER
+  let twilioOutboundBuffer = Buffer.alloc(0); 
+
+  // --- THE FIX: AUDIO PACING LOOP ---
+  // Twilio strictly requires 160-byte chunks every 20ms. 
+  setInterval(() => {
+    if (streamSid && twilioWs.readyState === WebSocket.OPEN && twilioOutboundBuffer.length >= 160) {
+      const frame = twilioOutboundBuffer.subarray(0, 160);
+      twilioOutboundBuffer = twilioOutboundBuffer.subarray(160);
+      
+      twilioWs.send(JSON.stringify({
+        event: 'media',
+        streamSid: streamSid,
+        media: { payload: frame.toString('base64') }
+      }));
+    }
+  }, 20);
 
   let pastMemoriesArray = [];
   try {
@@ -147,7 +161,6 @@ wss.on('connection', async (twilioWs, req) => {
     geminiWs.send(JSON.stringify(setupMessage));
   });
 
-  // Handle messages received from Gemini
   geminiWs.on('message', async (data) => {
     let response;
     try { response = JSON.parse(data); } catch (err) { return; }
@@ -168,7 +181,6 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
-    // --- FUNCTION CALL HANDLING ---
     if (response.toolCall) {
       const calls = response.toolCall.functionCalls || [];
       const functionResponses = [];
@@ -178,7 +190,6 @@ wss.on('connection', async (twilioWs, req) => {
           const fact = call.args.fact;
           try {
             await redisCommand('RPUSH', callerId, fact);
-            console.log(`Stored fact for ${callerId}: ${fact}`);
             functionResponses.push({ id: call.id, name: call.name, response: { status: 'Success. Fact saved permanently.' } });
           } catch (err) {
             functionResponses.push({ id: call.id, name: call.name, response: { error: 'Database fail.' } });
@@ -202,12 +213,10 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
-    // --- AUDIO OUTPUT (Gemini -> Twilio) ---
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-          console.log(`Received ${geminiBytes.length} bytes of audio from Gemini.`);
           
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
@@ -217,22 +226,8 @@ wss.on('connection', async (twilioWs, req) => {
             muLawBuffer[outIdx++] = pcmToMuLaw(pcm16);
           }
 
-          // Push the new audio into the holding tank
+          // Push to holding tank instead of sending immediately
           twilioOutboundBuffer = Buffer.concat([twilioOutboundBuffer, muLawBuffer]);
-
-          // Slice it into perfect 160-byte frames for Twilio
-          while (twilioOutboundBuffer.length >= 160) {
-            const frame = twilioOutboundBuffer.subarray(0, 160);
-            twilioOutboundBuffer = twilioOutboundBuffer.subarray(160);
-
-            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-              twilioWs.send(JSON.stringify({
-                event: 'media',
-                streamSid: streamSid,
-                media: { payload: frame.toString('base64') }
-              }));
-            }
-          }
         }
       }
     }
@@ -240,7 +235,6 @@ wss.on('connection', async (twilioWs, req) => {
 
   geminiWs.on('error', (err) => console.error('Gemini error:', err));
 
-  // --- AUDIO INPUT (Twilio -> Gemini) ---
   twilioWs.on('message', (message) => {
     let msg;
     try { msg = JSON.parse(message); } catch (err) { return; }
