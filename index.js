@@ -18,8 +18,7 @@ app.post('/voice', async (req, res) => {
     try {
       const model = genAI.getGenerativeModel({ model: "gemini-3.6-flash" });
       
-      // We append a hidden instruction so the AI keeps responses brief for a phone call
-      const prompt = userSpeech + " (Keep your answer conversational and brief, I am listening to this on a phone call.)";
+      const prompt = `${userSpeech} (Keep your answer conversational, natural, and brief, as this is being read over a live phone call.)`;
       const result = await model.generateContent(prompt);
       const responseText = result.response.text();
 
@@ -32,17 +31,25 @@ app.post('/voice', async (req, res) => {
 
     } catch (error) {
       console.error("AI Error:", error);
-      twiml.say("My system encountered an error. Please try again.");
-      twiml.hangup();
+      
+      const gather = twiml.gather({
+        input: 'speech',
+        action: '/voice',
+        speechTimeout: 'auto'
+      });
+      gather.say({ voice: 'Polly.Joanna' }, "I didn't quite catch that. Could you please repeat your question?");
     }
   } else {
-    // Initial greeting when the call connects
+    // Initial greeting introducing itself and asking for the caller's identity
     const gather = twiml.gather({
       input: 'speech',
       action: '/voice',
       speechTimeout: 'auto'
     });
-    gather.say({ voice: 'Polly.Joanna' }, "Hello Keyshawn, I am online. What's on your mind?");
+    gather.say(
+      { voice: 'Polly.Joanna' },
+      "Hello! I am your AI assistant. May I ask who is calling, and how can I help you today?"
+    );
   }
 
   res.type('text/xml');
