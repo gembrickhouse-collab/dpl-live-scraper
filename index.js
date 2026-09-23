@@ -11,7 +11,7 @@ const wss = new WebSocket.Server({ server, path: '/stream' });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Helper function to talk directly to Upstash without any extra npm packages
+// Helper function to talk directly to Upstash without extra npm packages
 async function redisCommand(command, ...args) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -81,7 +81,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     const setupMessage = {
       setup: {
-        model: 'models/gemini-2.0-flash-exp',
+        model: 'models/gemini-2.0-flash-exp-0827', // FIXED MODEL STRING
         systemInstruction: {
           parts: [{
             text: `You are a helpful voice assistant conversing over a phone call with caller ID ${callerId}. Keep responses natural, brief, and conversational. Saved facts from past calls: ${pastMemories}. If the caller shares important personal facts, invoke the save_memory tool. If they ask about the weather, invoke the get_weather tool.`
