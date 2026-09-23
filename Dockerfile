@@ -1,23 +1,23 @@
-FROM node:20-alpine
+FROM node:20
 
-# Install Chrome and necessary dependencies
-RUN apk add --no-cache \
-      chromium \
-      nss \
-      freetype \
-      harfbuzz \
-      ca-certificates \
-      ttf-freefont
-
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+# Install dependencies required by Puppeteer's headless Chrome
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    ca-certificates \
+    procps \
+    libxss1 \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm-dev \
+    libasound2 \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
-
 COPY package*.json ./
 RUN npm install
-
 COPY . .
-
 EXPOSE 3000
 CMD ["node", "index.js"]
