@@ -16,6 +16,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
+
+# NEW: Force Puppeteer to download Chrome into the permanent app directory
+ENV PUPPETEER_CACHE_DIR=/usr/src/app/.cache
+
 COPY package*.json ./
 RUN npm install
 COPY . .
