@@ -1,25 +1,16 @@
-FROM node:20
+FROM python:3.11-slim
 
-# Install the official Chromium package and its dependencies
+WORKDIR /app
+
+# Install system dependencies required for Pipecat
 RUN apt-get update && apt-get install -y \
-    chromium \
-    wget \
-    gnupg \
-    ca-certificates \
-    procps \
-    libxss1 \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    libgbm-dev \
-    libasound2 \
-    --no-install-recommends \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY package*.json ./
-RUN npm install
 COPY . .
-EXPOSE 3000
-CMD ["node", "index.js"]
+
+# Render dynamically assigns the PORT environment variable
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-3000}"]
