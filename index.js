@@ -6,37 +6,50 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const VoiceResponse = twilio.twiml.VoiceResponse;
 
-app.post('/sms', async (req, res) => {
-  // Acknowledge receipt immediately to prevent Twilio from timing out
-  res.status(200).end();
-  
-  const userPhoneNumber = req.body.From;
-  const userMessage = req.body.Body;
+app.post('/voice', async (req, res) => {
+  const twiml = new VoiceResponse();
+  const userSpeech = req.body.SpeechResult;
 
-  console.log(`Incoming SMS: ${userMessage}`);
+  if (userSpeech) {
+    console.log(`Heard: ${userSpeech}`);
+    try {
+      const model = genAI.getGenerativeModel({ model: "gemini-3.6-flash" });
+      
+      // We append a hidden instruction so the AI keeps responses brief for a phone call
+      const prompt = userSpeech + " (Keep your answer conversational and brief, I am listening to this on a phone call.)";
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
 
-  try {
-    const model = genAI.getGenerativeModel({ model: "gemini-3.6-flash" });
-    const result = await model.generateContent(userMessage);
-    const responseText = result.response.text();
+      const gather = twiml.gather({
+        input: 'speech',
+        action: '/voice',
+        speechTimeout: 'auto'
+      });
+      gather.say({ voice: 'Polly.Joanna' }, responseText);
 
-    await twilioClient.messages.create({
-      // Truncate at 1500 chars to avoid carrier delivery limits on long texts
-      body: responseText.substring(0, 1500), 
-      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-      to: userPhoneNumber
+    } catch (error) {
+      console.error("AI Error:", error);
+      twiml.say("My system encountered an error. Please try again.");
+      twiml.hangup();
+    }
+  } else {
+    // Initial greeting when the call connects
+    const gather = twiml.gather({
+      input: 'speech',
+      action: '/voice',
+      speechTimeout: 'auto'
     });
-    
-    console.log("AI response dispatched to carrier network.");
-  } catch (error) {
-    console.error("Pipeline failure:", error);
+    gather.say({ voice: 'Polly.Joanna' }, "Hello Keyshawn, I am online. What's on your mind?");
   }
+
+  res.type('text/xml');
+  res.send(twiml.toString());
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`AI Server online on port ${PORT}`);
+  console.log(`Voice AI Server online on port ${PORT}`);
 });
