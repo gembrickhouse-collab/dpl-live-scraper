@@ -66,8 +66,10 @@ app.post('/voice', (req, res) => {
   twiml.say({ voice: 'Polly.Joanna' }, "Connecting to Gemini Live.");
 
   const connect = twiml.connect();
+  // CRITICAL FIX: Twilio streams are read-only by default. We must explicitly enable both tracks.
   connect.stream({
     url: `wss://${req.get('host')}/stream?caller=${encodeURIComponent(callerId)}`,
+    track: 'both_tracks' 
   });
 
   res.type('text/xml');
@@ -166,7 +168,6 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
-    // Clear the outbound buffer if Gemini detects the user interrupted it
     if (response.serverContent?.interrupted) {
       console.log('Gemini detected user interruption. Clearing audio buffer.');
       twilioOutboundBuffer = Buffer.alloc(0);
@@ -237,7 +238,6 @@ wss.on('connection', async (twilioWs, req) => {
         break;
 
       case 'media':
-        // 1. Send Twilio's audio up to Gemini
         if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
@@ -262,8 +262,9 @@ wss.on('connection', async (twilioWs, req) => {
           }
         }
         
-        // 2. THE FIX: Use Twilio's incoming media tick as a perfect 20ms clock to send audio back!
-        if (streamSid && twilioOutboundBuffer.length >= 160) {
+        // Drain up to 10 frames (200ms) per tick to catch up without overflowing Twilio
+        let framesSent = 0;
+        while (streamSid && twilioOutboundBuffer.length >= 160 && framesSent < 10) {
           const frame = twilioOutboundBuffer.subarray(0, 160);
           twilioOutboundBuffer = twilioOutboundBuffer.subarray(160);
           
@@ -272,6 +273,7 @@ wss.on('connection', async (twilioWs, req) => {
             streamSid: streamSid,
             media: { payload: frame.toString('base64') }
           }));
+          framesSent++;
         }
         break;
         
