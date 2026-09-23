@@ -1,5 +1,5 @@
 {
-  "name": "dpl-live-scraper",
+  "name": "gemini-sms-bot",
   "version": "1.0.0",
   "main": "index.js",
   "engines": {
@@ -7,7 +7,7 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "puppeteer": "^22.0.0",
+    "@google/generative-ai": "^0.2.0",
     "twilio": "^5.0.0"
   }
 }
