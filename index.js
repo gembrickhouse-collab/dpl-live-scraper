@@ -28,11 +28,17 @@ async function scrapeDPL(query) {
     const searchUrl = `https://catalog.denverlibrary.org/search/searchresults.aspx?type=Keyword&term=${encodeURIComponent(cleanQuery)}`;
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
     
-    // NEW: Force the browser to wait 3 extra seconds to let live inventory numbers populate
-    console.log("Waiting 3 seconds for live inventory to load...");
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // NEW: Force the browser to click the "Where is it?" button
+    console.log("Clicking the availability button...");
+    try {
+      await page.click('#buttonAvailability_1');
+      // Wait 2 seconds for the hidden inventory drawer to slide open
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    } catch (e) {
+      console.log("Could not find or click the availability button.");
+    }
     
-    // THE AVAILABILITY INSPECTOR
+    // THE AVAILABILITY INSPECTOR (Round 2)
     const diagnosticData = await page.evaluate(() => {
       const firstTitle = document.querySelector('.nsm-brief-action-link');
       if (!firstTitle) return "No titles found.";
@@ -43,20 +49,20 @@ async function scrapeDPL(query) {
         if (container.parentElement) container = container.parentElement;
       }
 
-      // Map out every class and the text inside it for this specific book
+      // Map out every class and the newly revealed text inside it
       let elementsMap = [];
       const elements = container.querySelectorAll('*');
       for (let el of elements) {
         if (el.className && typeof el.className === 'string') {
           const text = el.innerText ? el.innerText.trim().replace(/\n/g, ' ').substring(0, 60) : '';
-          // Filter out massive wrapper elements to keep the log clean
           if (text.length > 0 && text.length < 60) { 
              elementsMap.push(`[CLASS: ${el.className.trim()}] TEXT: ${text}`);
           }
         }
       }
       
-      return `--- RAW CARD TEXT ---\n${container.innerText.substring(0, 300)}\n\n--- CLASS MAP ---\n${[...new Set(elementsMap)].join('\n')}`;
+      // Expanded the raw text grab to 500 characters to catch the drawer contents
+      return `--- EXPANDED CARD TEXT ---\n${container.innerText.substring(0, 500)}\n\n--- CLASS MAP ---\n${[...new Set(elementsMap)].join('\n')}`;
     });
 
     console.log(`\n--- AVAILABILITY DIAGNOSTIC ---`);
@@ -65,7 +71,7 @@ async function scrapeDPL(query) {
 
     await browser.close();
 
-    return `Inventory diagnostic complete for "${cleanQuery}". Check the Render logs!`;
+    return `Expanded diagnostic complete for "${cleanQuery}". Check the Render logs!`;
   } catch (error) {
     if (browser) await browser.close();
     console.error("Scraper error:", error.message);
