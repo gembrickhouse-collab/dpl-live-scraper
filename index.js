@@ -205,12 +205,10 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
 
-    // --- AUDIO OUTPUT (Gemini -> Twilio Holding Tank) ---
     if (response.serverContent?.modelTurn?.parts) {
       for (const part of response.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           const geminiBytes = Buffer.from(part.inlineData.data, 'base64');
-          console.log(`[Gemini] Transcoding and dropping ${geminiBytes.length} bytes into holding tank.`);
           
           const muLawBuffer = Buffer.alloc(Math.floor(geminiBytes.length / 6));
           let outIdx = 0;
@@ -232,7 +230,6 @@ wss.on('connection', async (twilioWs, req) => {
     console.log(`Gemini session closed. Code: ${code}, Reason: ${reason}`);
   });
 
-  // --- AUDIO INPUT & PACING CLOCK (Twilio -> Gemini -> Twilio) ---
   twilioWs.on('message', (message) => {
     let msg;
     try { msg = JSON.parse(message); } catch (err) { return; }
@@ -243,8 +240,7 @@ wss.on('connection', async (twilioWs, req) => {
         break;
 
       case 'media':
-        // 1. Send incoming audio up to Gemini
-        if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady) {
+        if (geminiWs.readyState === WebSocket.OPEN && isGeminiReady && twilioOutboundBuffer.length === 0) {
           const twilioBytes = Buffer.from(msg.media.payload, 'base64');
           const pcmBuffer = Buffer.alloc(twilioBytes.length * 4);
 
@@ -268,10 +264,9 @@ wss.on('connection', async (twilioWs, req) => {
           }
         }
 
-        // 2. Safely drain the holding tank back to Twilio
         if (streamSid && twilioOutboundBuffer.length >= 160) {
           if (!isBufferPrimed) {
-             const primeFrames = Math.min(5, Math.floor(twilioOutboundBuffer.length / 160));
+             const primeFrames = Math.min(25, Math.floor(twilioOutboundBuffer.length / 160));
              for (let i = 0; i < primeFrames; i++) {
                 const frame = twilioOutboundBuffer.subarray(0, 160);
                 twilioOutboundBuffer = Buffer.from(twilioOutboundBuffer.subarray(160));
@@ -292,7 +287,9 @@ wss.on('connection', async (twilioWs, req) => {
              }));
           }
         } else {
+           // THE QA FIX: Vaporize any stray leftover bytes so the microphone unlocks
            isBufferPrimed = false; 
+           twilioOutboundBuffer = Buffer.alloc(0); 
         }
         break;
         
