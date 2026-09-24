@@ -6,3 +6,4 @@ livekit-plugins-google
 livekit-plugins-deepgram
 livekit-plugins-openai
 livekit-plugins-elevenlabs
+httpx
