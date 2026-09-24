@@ -1,23 +1,8 @@
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, AgentSession, Agent, function_tool, RunContext
 from livekit.plugins import google
 
-# 1. Trick Render by opening a dummy web port in the background
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"LiveKit Agent is running!")
-    httpd = HTTPServer(('', port), Handler)
-    httpd.serve_forever()
-
-threading.Thread(target=run_dummy_server, daemon=True).start()
-
-# 2. Normal LiveKit logic below
+# Map your existing Render variable so the Google plugin can find it
 if "GEMINI_API_KEY" in os.environ and "GOOGLE_API_KEY" not in os.environ:
     os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
@@ -42,13 +27,17 @@ class LiveVoiceAgent(Agent):
 async def entrypoint(ctx: JobContext):
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
+    # AgentSession handles VAD, STT, LLM, and TTS routing
     session = AgentSession(
         stt=google.STT(),
         llm=google.LLM(model="gemini-3.8-live"),
         tts=google.TTS(),
     )
 
+    # Start the session with your custom agent
     await session.start(room=ctx.room, agent=LiveVoiceAgent())
+    
+    # Prompt the AI to speak first
     await session.generate_reply(instructions="Greet the caller and say you are connected and ready.")
 
 if __name__ == "__main__":
