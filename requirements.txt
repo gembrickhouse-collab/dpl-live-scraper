@@ -1,3 +1,8 @@
+livekit
 livekit-agents
-livekit-plugins-google
+livekit-api
 livekit-plugins-silero
+livekit-plugins-google
+livekit-plugins-deepgram
+livekit-plugins-openai
+livekit-plugins-elevenlabs
