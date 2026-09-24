@@ -1,46 +1,45 @@
 import os
-import asyncio
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm
-from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.plugins import google, silero
+from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, AgentSession, Agent, function_tool
+from livekit.plugins import google
 
-# 1. Map your existing Render variable so the Google plugin can find it
+# Map your existing Render variable so the Google plugin can find it
 if "GEMINI_API_KEY" in os.environ and "GOOGLE_API_KEY" not in os.environ:
     os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
-# 2. Define tools using LiveKit's native function context
-class AssistantFunctions(llm.FunctionContext):
-    @llm.ai_callable(description="Get the current weather for a location")
+# Define your AI Agent and its native tools
+class LiveVoiceAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            instructions="You are a helpful voice assistant conversing over a phone call. Keep responses natural, brief, and conversational."
+        )
+
+    @function_tool()
     async def get_weather(self, location: str):
+        """Get the current weather for a location."""
         # Add your wttr.in fetch logic here
         return f"Weather info for {location} is unavailable."
 
-    @llm.ai_callable(description="Save a fact to memory")
+    @function_tool()
     async def save_memory(self, fact: str):
+        """Save a fact to memory."""
         # Add your Upstash Redis logic here
         return "Fact saved permanently."
 
 async def entrypoint(ctx: JobContext):
-    initial_ctx = llm.ChatContext().append(
-        role="system",
-        text="You are a helpful voice assistant conversing over a phone call. Keep responses natural, brief, and conversational."
-    )
-    
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # 3. Pass the function context into the Voice Pipeline
-    agent = VoicePipelineAgent(
-        vad=silero.VAD.load(),
+    # AgentSession automatically handles VAD and turn detection natively
+    session = AgentSession(
         stt=google.STT(),
         llm=google.LLM(model="gemini-3.8-live"),
         tts=google.TTS(),
-        chat_ctx=initial_ctx,
-        fnc_ctx=AssistantFunctions(),
     )
 
-    agent.start(ctx.room)
-    await asyncio.sleep(1)
-    await agent.say("Hi there. I am connected and ready.", allow_interruptions=True)
+    # Start the session with your custom agent
+    await session.start(room=ctx.room, agent=LiveVoiceAgent())
+    
+    # Prompt the AI to speak first
+    await session.generate_reply(instructions="Greet the caller and say you are connected and ready.")
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
