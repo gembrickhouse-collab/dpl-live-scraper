@@ -2,7 +2,6 @@ import os
 import uvicorn
 from fastapi import FastAPI, WebSocket
 
-# THE FIX: Updated to the new Pipecat 1.11.0 import paths
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
@@ -25,8 +24,11 @@ async def save_memory(fact: str):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    # 2. Automatically handle Twilio's exact audio format
-    serializer = TwilioFrameSerializer(stream_sid="temp")
+    # 2. Automatically handle Twilio's exact audio format, disabling the credential-required auto hang-up
+    serializer = TwilioFrameSerializer(
+        stream_sid="temp",
+        auto_hang_up=False
+    )
     
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
