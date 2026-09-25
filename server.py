@@ -20,7 +20,7 @@ load_dotenv()
 logger = logging.getLogger("keyshawn-voice-agent")
 logger.setLevel(logging.INFO)
 
-# Prewarm Silero VAD into memory when the Railway container starts
+
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
@@ -107,27 +107,21 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect()
     logger.info(f"Connected to call room: {ctx.room.name}")
 
-    # Use prewarmed VAD or load as fallback
     vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
-
-    # Allow overriding the model via Railway env var if Google ever updates model names again
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
     session = AgentSession(
         vad=vad,
         stt=deepgram.STT(),
-        llm=google.LLM(model=gemini_model),
+        llm=google.LLM(model="gemini-3.8-flash"),
         tts=deepgram.TTS(),
     )
 
     await session.start(agent=KeyshawnAssistant(), room=ctx.room)
 
+    # session.say sends audio directly to Deepgram TTS instantly with zero LLM wait
     try:
-        await session.generate_reply(
-            instructions=(
-                "Greet the caller warmly, thank them for calling Keyshawn Bannister Initiatives, "
-                "and ask how you can help them today."
-            )
+        await session.say(
+            "Hello, thanks for calling Keyshawn Bannister Initiatives! How can I help you today?"
         )
     except Exception as e:
         logger.error(f"Opening greeting failed: {e}")
