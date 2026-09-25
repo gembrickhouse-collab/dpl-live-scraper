@@ -22,7 +22,12 @@ logger.setLevel(logging.INFO)
 
 
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    # Wait slightly longer (0.8s) for the caller to finish a full sentence
+    # so brief pauses don't trigger unnecessary Gemini requests
+    proc.userdata["vad"] = silero.VAD.load(
+        min_speech_duration=0.2,
+        min_silence_duration=0.8,
+    )
 
 
 @function_tool
@@ -107,12 +112,18 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect()
     logger.info(f"Connected to call room: {ctx.room.name}")
 
-    vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
+    vad = ctx.proc.userdata.get("vad") or silero.VAD.load(
+        min_speech_duration=0.2,
+        min_silence_duration=0.8,
+    )
+
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
     session = AgentSession(
         vad=vad,
         stt=deepgram.STT(),
-        llm=google.LLM(model="gemini-3.8-flash"),
+        llm=google.LLM(model=gemini_model, api_key=api_key),
         tts=deepgram.TTS(),
     )
 
