@@ -12,7 +12,6 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
-    llm,
 )
 from livekit.plugins import deepgram, google, silero
 
@@ -23,6 +22,7 @@ logger.setLevel(logging.INFO)
 
 
 def prewarm(proc: JobProcess):
+    # Wait 0.8s after the caller stops speaking before sending a request
     proc.userdata["vad"] = silero.VAD.load(
         min_speech_duration=0.2,
         min_silence_duration=0.8,
@@ -118,19 +118,13 @@ async def entrypoint(ctx: JobContext):
 
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
-    # Automatically falls back if any model hits a 503 High Demand spike
-    fallback_llm = llm.FallbackAdapter(
-        [
-            google.LLM(model="gemini-3.5-flash-lite", api_key=api_key),
-            google.LLM(model="gemini-3.7-flash", api_key=api_key),
-            google.LLM(model="gemini-3.8-flash", api_key=api_key),
-        ]
-    )
-
     session = AgentSession(
         vad=vad,
         stt=deepgram.STT(),
-        llm=fallback_llm,
+        llm=google.LLM(
+            model="gemini-3.5-flash-lite",
+            api_key=api_key,
+        ),
         tts=deepgram.TTS(),
     )
 
