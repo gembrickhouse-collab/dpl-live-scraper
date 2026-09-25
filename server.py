@@ -1,97 +1,136 @@
 import os
+import logging
+from urllib.parse import quote
 import httpx
+from dotenv import load_dotenv
 from livekit.agents import (
-    AutoSubscribe,
-    JobContext,
-    JobProcess,
-    WorkerOptions,
-    cli,
     Agent,
     AgentSession,
-    function_tool,
+    JobContext,
+    JobProcess,
     RunContext,
+    WorkerOptions,
+    cli,
+    function_tool,
 )
-from livekit.plugins import google, deepgram, silero, openai
+from livekit.plugins import deepgram, google, silero
 
-# Map your existing variable so the Gemini plugin can find it
-if "GEMINI_API_KEY" in os.environ and "GOOGLE_API_KEY" not in os.environ:
-    os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+load_dotenv()
 
+logger = logging.getLogger("keyshawn-voice-agent")
+logger.setLevel(logging.INFO)
 
-# 1. PREWARM FIX: Load VAD into RAM at container startup so the first ring is instant
+# Prewarm Silero VAD into memory when the Railway container starts
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
-class LiveVoiceAgent(Agent):
-    def __init__(self):
+@function_tool
+async def get_weather(context: RunContext, location: str) -> str:
+    """Get the current weather for a given city or location."""
+    try:
+        safe_location = quote(location.strip())
+        url = f"https://wttr.in/{safe_location}?format=3"
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            response = await client.get(url)
+            if response.status_code == 200 and response.text.strip():
+                return response.text.strip()
+            return f"Could not retrieve weather for {location} right now."
+    except Exception as e:
+        logger.warning(f"Weather tool failed: {e}")
+        return f"Weather service is temporarily unavailable for {location}."
+
+
+@function_tool
+async def save_memory(context: RunContext, key: str, value: str) -> str:
+    """Save an important piece of information or note to persistent memory."""
+    redis_url = os.getenv("UPSTASH_REDIS_REST_URL")
+    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+    if not redis_url or not redis_token:
+        return "Memory storage is not configured yet."
+
+    try:
+        headers = {"Authorization": f"Bearer {redis_token}"}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.post(
+                f"{redis_url.rstrip('/')}/set/{quote(key)}/{quote(value)}",
+                headers=headers,
+            )
+            if res.status_code == 200:
+                return f"Saved {key} to memory."
+            return "Failed to save that note right now."
+    except Exception as e:
+        logger.warning(f"Redis save_memory failed: {e}")
+        return "Memory service is temporarily unreachable."
+
+
+@function_tool
+async def get_memory(context: RunContext, key: str) -> str:
+    """Retrieve a previously saved piece of information from persistent memory."""
+    redis_url = os.getenv("UPSTASH_REDIS_REST_URL")
+    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+    if not redis_url or not redis_token:
+        return "Memory storage is not configured yet."
+
+    try:
+        headers = {"Authorization": f"Bearer {redis_token}"}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.get(
+                f"{redis_url.rstrip('/')}/get/{quote(key)}",
+                headers=headers,
+            )
+            if res.status_code == 200:
+                data = res.json()
+                result = data.get("result")
+                return f"Memory for {key}: {result}" if result else f"No saved memory found for {key}."
+            return f"Could not look up {key} right now."
+    except Exception as e:
+        logger.warning(f"Redis get_memory failed: {e}")
+        return "Memory service is temporarily unreachable."
+
+
+class KeyshawnAssistant(Agent):
+    def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You are a helpful voice assistant for Keyshawn Bannister Initiatives. "
-                "Keep your answers concise, warm, and conversational."
-            )
+                "You are the official AI voice assistant for Keyshawn Bannister Initiatives. "
+                "You are speaking live on a phone call. Keep all answers concise, warm, and "
+                "conversational—ideally one to two short sentences at a time. "
+                "Never use markdown, asterisks, bullet points, or emojis, because your text "
+                "is read aloud directly by a text-to-speech engine."
+            ),
+            tools=[get_weather, save_memory, get_memory],
         )
-
-    # 2. ASYNC WEATHER FIX: Uses httpx.AsyncClient so audio never stutters or blocks
-    @function_tool()
-    async def get_weather(self, context: RunContext, location: str):
-        """Get the current weather for a location."""
-        url = f"https://wttr.in/{location}?format=%C+%t"
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url)
-                if response.status_code == 200:
-                    return f"The current weather in {location} is {response.text.strip()}."
-        except Exception:
-            pass
-        return f"Unable to fetch live weather for {location} right now."
-
-    # 3. ASYNC MEMORY FIX: Non-blocking Upstash Redis REST call (with safe fallback)
-    @function_tool()
-    async def save_memory(self, context: RunContext, fact: str):
-        """Save an important fact or caller detail to memory."""
-        redis_url = os.environ.get("UPSTASH_REDIS_REST_URL")
-        redis_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
-
-        if redis_url and redis_token:
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(
-                        f"{redis_url}/lpush/agent_memories",
-                        headers={"Authorization": f"Bearer {redis_token}"},
-                        json=[fact],
-                    )
-                    return "Fact saved permanently to memory."
-            except Exception:
-                return "Noted for this call, though permanent database storage timed out."
-        return f"Noted in session memory: {fact}"
 
 
 async def entrypoint(ctx: JobContext):
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    await ctx.connect()
+    logger.info(f"Connected to call room: {ctx.room.name}")
 
-    # Pull pre-loaded Silero VAD from RAM (or load as fallback)
-    vad_instance = ctx.proc.userdata.get("vad") or silero.VAD.load()
+    # Use prewarmed VAD or load as fallback
+    vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
 
-    # 4. RATE-LIMIT FALLBACK: Uses OpenAI if OPENAI_API_KEY is added to Railway, else Gemini
-    if os.environ.get("OPENAI_API_KEY"):
-        llm_engine = openai.LLM(model="gpt-4o-mini")
-    else:
-        llm_engine = google.LLM(model="gemini-2.0-flash")
+    # Allow overriding the model via Railway env var if Google ever updates model names again
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
     session = AgentSession(
-        vad=vad_instance,
+        vad=vad,
         stt=deepgram.STT(),
-        llm=llm_engine,
+        llm=google.LLM(model=gemini_model),
         tts=deepgram.TTS(),
     )
 
-    await session.start(room=ctx.room, agent=LiveVoiceAgent())
+    await session.start(agent=KeyshawnAssistant(), room=ctx.room)
 
-    # Speak first immediately when the call connects
-    await session.generate_reply(
-        instructions="Greet the caller warmly on behalf of Keyshawn Bannister Initiatives and ask how you can help them today."
-    )
+    try:
+        await session.generate_reply(
+            instructions=(
+                "Greet the caller warmly, thank them for calling Keyshawn Bannister Initiatives, "
+                "and ask how you can help them today."
+            )
+        )
+    except Exception as e:
+        logger.error(f"Opening greeting failed: {e}")
 
 
 if __name__ == "__main__":
